@@ -1,0 +1,12 @@
+{
+  "name": "billing-system",
+  "private": true,
+  "scripts": {
+    "build": "npm run build --prefix frontend && npm run copy:frontend",
+    "copy:frontend": "node scripts/copy-frontend.mjs",
+    "start": "npm run start --prefix backend",
+    "docker:up": "docker compose up -d --build",
+    "docker:down": "docker compose down",
+    "docker:logs": "docker compose logs -f app"
+  }
+}
