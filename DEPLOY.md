@@ -1,6 +1,8 @@
-# Deploy HD E-MATE Billing System
+# Deploy Purn Sanket Electrols
 
 This app has a **React frontend** and **Node.js + PostgreSQL backend**. The easiest way to deploy is **Docker Compose** (one command, includes database).
+
+> **Do not use GitHub Pages.** Pages cannot run this app (no Node, no database). Enabling Pages causes a **404 File not found**. Use Docker or a VPS instead. In the repo: **Settings → Pages → Source → None**.
 
 ---
 
