@@ -1,12 +1,11 @@
-import { Plus, Minus, Download, Filter, Pencil, Upload } from 'lucide-react'
-import { Fragment, useEffect, useRef, useState } from 'react'
+import { Plus, Minus, Download, Filter, Pencil } from 'lucide-react'
+import { Fragment, useEffect, useState } from 'react'
 import { apiFetch, getStoredUser } from '../services/api'
 import { downloadExcel } from '../utils/exportExcel'
 import ImportCsvButton from '../components/ImportCsvButton'
 import EditWindowBadge from '../components/EditWindowBadge'
 import { getEditWindowInfo } from '../utils/editWindow'
 import { canExport } from '../utils/roleAccess'
-import { parseStkSumExcel } from '../utils/importStkSum'
 
 interface InventoryItem {
   id: number
@@ -59,8 +58,6 @@ export default function Inventory() {
     qty: '',
     date: todayLabel(),
   })
-  const [stkImporting, setStkImporting] = useState(false)
-  const stkFileRef = useRef<HTMLInputElement>(null)
   const [isNewItem, setIsNewItem] = useState(false)
   const [formData, setFormData] = useState({
     id: '',
@@ -255,25 +252,6 @@ export default function Inventory() {
     fetchItems()
   }
 
-  const handleStkSumImport = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0]
-    if (!file) return
-    setStkImporting(true)
-    try {
-      const rows = await parseStkSumExcel(file)
-      if (rows.length === 0) {
-        alert('No Particulars found in this Excel file')
-        return
-      }
-      await handleImport(rows)
-    } catch (error) {
-      alert(error instanceof Error ? error.message : 'Failed to import StkSum Excel')
-    } finally {
-      setStkImporting(false)
-      if (stkFileRef.current) stkFileRef.current.value = ''
-    }
-  }
-
   const filtered = items.filter((item) => {
     if (!search.trim()) return true
     return item.name.toLowerCase().includes(search.toLowerCase())
@@ -309,22 +287,6 @@ export default function Inventory() {
             </button>
           )}
           <ImportCsvButton onImport={handleImport} label="Import CSV" />
-          <input
-            ref={stkFileRef}
-            type="file"
-            accept=".xlsx,.xls,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            className="hidden"
-            onChange={handleStkSumImport}
-          />
-          <button
-            type="button"
-            onClick={() => stkFileRef.current?.click()}
-            disabled={stkImporting}
-            className="flex items-center gap-2 rounded-xl border border-slate-300 px-4 py-2.5 font-medium text-slate-700 transition hover:bg-slate-50 disabled:opacity-60"
-          >
-            <Upload className="h-4 w-4" />
-            {stkImporting ? 'Importing...' : 'Import StkSum Excel'}
-          </button>
           <button onClick={openNewForm} className="flex items-center gap-2 rounded-xl bg-blue-600 px-4 py-2.5 font-medium text-white transition hover:bg-blue-700">
             <Plus className="h-4 w-4" />
             Add Inventory
