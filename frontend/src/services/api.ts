@@ -41,11 +41,12 @@ export async function refreshStoredUser(): Promise<User | null> {
 
   try {
     const data = await apiFetch<User & { created_at?: string }>('/api/auth/me')
+    const current = getStoredUser()
     const user: User = {
       id: data.id,
       name: data.name,
       email: data.email,
-      role: data.role,
+      role: data.role || current?.role || 'pending',
     }
     saveAuth(token, user)
     return user

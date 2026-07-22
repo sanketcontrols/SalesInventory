@@ -66,6 +66,7 @@ export async function initializeDatabase() {
         available INTEGER NOT NULL,
         pending INTEGER NOT NULL,
         reserved INTEGER NOT NULL,
+        required_qty INTEGER DEFAULT 0,
         status VARCHAR(50) NOT NULL,
         created_by INTEGER,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -96,7 +97,7 @@ export async function initializeDatabase() {
     await pool.query(`
       CREATE TABLE IF NOT EXISTS company_settings (
         id SERIAL PRIMARY KEY,
-        company_name VARCHAR(255) NOT NULL DEFAULT 'HD Engineering Solutions',
+        company_name VARCHAR(255) NOT NULL DEFAULT 'Purn Sanket Electrols',
         address TEXT DEFAULT '',
         gst_no VARCHAR(50) DEFAULT '',
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -116,9 +117,66 @@ export async function initializeDatabase() {
     await pool.query(`ALTER TABLE customers ADD COLUMN IF NOT EXISTS address TEXT DEFAULT ''`)
     await pool.query(`ALTER TABLE inventory ADD COLUMN IF NOT EXISTS created_by INTEGER`)
     await pool.query(`ALTER TABLE inventory ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP`)
+    await pool.query(`ALTER TABLE inventory ADD COLUMN IF NOT EXISTS required_qty INTEGER DEFAULT 0`)
+    await pool.query(`ALTER TABLE inventory ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP`)
+    await pool.query(`ALTER TABLE customers ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP`)
+    await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP`)
+    await pool.query(`ALTER TABLE product_codes ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP`)
     await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS product_code_id INTEGER`)
     await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS product_code VARCHAR(50)`)
     await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS product_name VARCHAR(255)`)
+    await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS stock_booked BOOLEAN DEFAULT FALSE`)
+    await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS no_of_days INTEGER DEFAULT 0`)
+    await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS ok_to_mfg BOOLEAN DEFAULT FALSE`)
+    await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS closed_at TIMESTAMP`)
+    // Backfill closing time for already completed/cancelled orders
+    await pool.query(`
+      UPDATE orders
+      SET closed_at = COALESCE(updated_at, created_at)
+      WHERE status IN ('Completed', 'Cancelled')
+        AND closed_at IS NULL
+    `)
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS inventory_movements (
+        id SERIAL PRIMARY KEY,
+        inventory_id INTEGER NOT NULL REFERENCES inventory(id) ON DELETE CASCADE,
+        order_no VARCHAR(50) DEFAULT '',
+        product_code VARCHAR(50) DEFAULT '',
+        qty INTEGER NOT NULL,
+        movement_date VARCHAR(50) NOT NULL,
+        note TEXT DEFAULT '',
+        created_by INTEGER,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `)
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS order_items (
+        id SERIAL PRIMARY KEY,
+        order_id INTEGER NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+        product_code_id INTEGER,
+        product_code VARCHAR(50),
+        product_name VARCHAR(255),
+        qty INTEGER NOT NULL DEFAULT 1,
+        amount VARCHAR(50) DEFAULT '₹ 0',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `)
+    await pool.query(`ALTER TABLE order_items ADD COLUMN IF NOT EXISTS unit_price VARCHAR(50) DEFAULT '₹ 0'`)
+    await pool.query(`ALTER TABLE order_items ADD COLUMN IF NOT EXISTS description TEXT DEFAULT ''`)
+    await pool.query(`
+      INSERT INTO order_items (order_id, product_code_id, product_code, product_name, qty, amount)
+      SELECT id, product_code_id, product_code, product_name, qty, amount
+      FROM orders o
+      WHERE product_code_id IS NOT NULL
+        AND NOT EXISTS (SELECT 1 FROM order_items oi WHERE oi.order_id = o.id)
+    `)
+    await pool.query(`
+      UPDATE orders
+      SET stock_booked = TRUE
+      WHERE product_code_id IS NOT NULL
+        AND status <> 'Cancelled'
+        AND (stock_booked IS NULL OR stock_booked = FALSE)
+    `)
 
     // Ensure primary admin account
     await pool.query(`UPDATE users SET role = 'admin' WHERE email = 'harsh@gmail.com'`)
@@ -231,9 +289,9 @@ export async function initializeDatabase() {
       await pool.query(
         `INSERT INTO company_settings (company_name, address, gst_no) VALUES ($1, $2, $3)`,
         [
-          'HD Engineering Solutions',
-          'Plot 42, MIDC Industrial Area, Pune, Maharashtra 411019',
-          '27AABCU9603R1ZM',
+          'Purn Sanket Electrols',
+          '',
+          '',
         ]
       )
       console.log('Default company settings created')

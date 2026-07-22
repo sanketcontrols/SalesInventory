@@ -2,7 +2,7 @@ import { Plus, Download, Filter, Mail, Phone, Hash, MapPin } from 'lucide-react'
 import { useState, useEffect } from 'react'
 import { Link } from 'react-router-dom'
 import { apiFetch, getStoredUser } from '../services/api'
-import { downloadCsv } from '../utils/exportCsv'
+import { downloadExcel } from '../utils/exportExcel'
 import ImportCsvButton from '../components/ImportCsvButton'
 import { ensureRupee } from '../utils/formatRupee'
 import EditWindowBadge from '../components/EditWindowBadge'
@@ -95,10 +95,31 @@ export default function Customers() {
   }
 
   const handleExport = () => {
-    downloadCsv(
-      'customers.csv',
-      ['Name', 'Email', 'Phone', 'City', 'State', 'GST No', 'Address', 'Orders', 'Total Amount'],
-      customers.map((c) => [c.name, c.email, c.phone, c.city, c.state, c.gst_no || '', c.address || '', c.orders_count, c.total_amount])
+    downloadExcel(
+      'customers.xlsx',
+      'Customers',
+      [
+        { header: 'Name' },
+        { header: 'Email' },
+        { header: 'Phone' },
+        { header: 'City' },
+        { header: 'State' },
+        { header: 'GST No' },
+        { header: 'Address' },
+        { header: 'Orders', type: 'number' },
+        { header: 'Total Amount (INR)', type: 'inr' },
+      ],
+      customers.map((c) => [
+        c.name,
+        c.email,
+        c.phone,
+        c.city,
+        c.state,
+        c.gst_no || '',
+        c.address || '',
+        c.orders_count,
+        c.total_amount,
+      ])
     )
   }
 
@@ -216,7 +237,7 @@ export default function Customers() {
               <p><strong>Total Amount:</strong> {ensureRupee(viewCustomer.total_amount)}</p>
             </div>
             <div className="mt-6 flex gap-2">
-              <Link to="/company-profile" className="flex-1 rounded-xl bg-blue-600 px-4 py-2 text-center font-medium text-white transition hover:bg-blue-700">
+              <Link to={`/company-profile?id=${viewCustomer.id}`} className="flex-1 rounded-xl bg-blue-600 px-4 py-2 text-center font-medium text-white transition hover:bg-blue-700">
                 Open Profile
               </Link>
               <button onClick={() => setViewCustomer(null)} className="rounded-xl border border-slate-300 px-4 py-2 font-medium text-slate-700 transition hover:bg-slate-50">Close</button>

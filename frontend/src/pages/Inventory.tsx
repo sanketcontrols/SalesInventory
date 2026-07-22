@@ -1,80 +1,84 @@
-import { Plus, Download, Filter, AlertTriangle, Package, Trash2, Pencil } from 'lucide-react'
-import { useState, useEffect } from 'react'
+import { Plus, Minus, Download, Filter, Pencil, Upload } from 'lucide-react'
+import { Fragment, useEffect, useRef, useState } from 'react'
 import { apiFetch, getStoredUser } from '../services/api'
-import { downloadCsv } from '../utils/exportCsv'
+import { downloadExcel } from '../utils/exportExcel'
 import ImportCsvButton from '../components/ImportCsvButton'
 import EditWindowBadge from '../components/EditWindowBadge'
 import { getEditWindowInfo } from '../utils/editWindow'
-import { canDelete, canExport } from '../utils/roleAccess'
+import { canExport } from '../utils/roleAccess'
+import { parseStkSumExcel } from '../utils/importStkSum'
 
 interface InventoryItem {
   id: number
   name: string
-  sku: string
   available: number
+  qty?: number
+  remaining?: number
+  monthly_avg: number
   pending: number
+  booked?: number
   reserved: number
   status: string
   created_at?: string
   created_by?: number
 }
 
-interface CodeItem {
-  id?: number
-  inventory_id: number
-  qty_per_unit: number
-  name?: string
-  sku?: string
-  available?: number
+interface BookingRow {
+  order_no: string
+  product_code: string
+  qty: number
+  date: string
+  status?: string
+  source?: string
 }
 
-interface ProductCode {
-  id: number
-  code: string
-  name: string
-  description: string
-  items: CodeItem[]
+function todayLabel() {
+  return new Date().toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' })
 }
 
 export default function Inventory() {
   const user = getStoredUser()
   const role = user?.role
   const canExportCsv = canExport(role)
-  const canRemove = canDelete(role)
+  const canAdjust = role === 'admin' || role === 'inventory'
 
-  const [tab, setTab] = useState<'codes' | 'stock'>('codes')
   const [showForm, setShowForm] = useState(false)
   const [showFilter, setShowFilter] = useState(false)
   const [statusFilter, setStatusFilter] = useState('')
+  const [search, setSearch] = useState('')
   const [items, setItems] = useState<InventoryItem[]>([])
-  const [productCodes, setProductCodes] = useState<ProductCode[]>([])
   const [loading, setLoading] = useState(true)
-  const [formData, setFormData] = useState({ id: '', name: '', sku: '', available: '', pending: '', reserved: '', status: 'Normal' })
-  const [isNewItem, setIsNewItem] = useState(false)
-
-  const [codeForm, setCodeForm] = useState({
-    id: '',
-    code: '',
-    name: '',
-    description: '',
-    items: [] as { inventory_id: number; qty_per_unit: number }[],
+  const [adjustingId, setAdjustingId] = useState<number | null>(null)
+  const [expandedIds, setExpandedIds] = useState<Set<number>>(new Set())
+  const [bookingsById, setBookingsById] = useState<Record<number, BookingRow[]>>({})
+  const [loadingBookings, setLoadingBookings] = useState<number | null>(null)
+  const [addQtyId, setAddQtyId] = useState<number | null>(null)
+  const [addQtyForm, setAddQtyForm] = useState({
+    order_no: '',
+    product_code: '',
+    qty: '',
+    date: todayLabel(),
   })
-  const [showCodeForm, setShowCodeForm] = useState(false)
-  const [isNewCode, setIsNewCode] = useState(false)
+  const [stkImporting, setStkImporting] = useState(false)
+  const stkFileRef = useRef<HTMLInputElement>(null)
+  const [isNewItem, setIsNewItem] = useState(false)
+  const [formData, setFormData] = useState({
+    id: '',
+    name: '',
+    available: '',
+  })
 
   useEffect(() => {
-    fetchAll()
+    fetchItems()
   }, [statusFilter])
 
-  const fetchAll = async () => {
+  const fetchItems = async () => {
     try {
-      const params = statusFilter ? `?status=${encodeURIComponent(statusFilter)}` : ''
-      const [invData, codesData] = await Promise.all([
-        apiFetch<InventoryItem[]>(`/api/inventory${params}`),
-        apiFetch<ProductCode[]>('/api/product-codes'),
-      ])
-      setItems(invData)
-      setProductCodes(codesData)
+      const params = new URLSearchParams()
+      if (statusFilter) params.set('status', statusFilter)
+      const qs = params.toString() ? `?${params}` : ''
+      const data = await apiFetch<InventoryItem[]>(`/api/inventory${qs}`)
+      setItems(data)
     } catch (error) {
       console.error('Error fetching inventory:', error)
     } finally {
@@ -82,187 +86,218 @@ export default function Inventory() {
     }
   }
 
-  const openUpdateForm = (item: InventoryItem) => {
-    setIsNewItem(false)
-    setFormData({
-      id: String(item.id),
-      name: item.name,
-      sku: item.sku,
-      available: String(item.available),
-      pending: String(item.pending),
-      reserved: String(item.reserved),
-      status: item.status,
+  const loadBookings = async (inventoryId: number) => {
+    setLoadingBookings(inventoryId)
+    try {
+      const data = await apiFetch<{ bookings: BookingRow[] }>(`/api/inventory/${inventoryId}/bookings`)
+      setBookingsById((prev) => ({ ...prev, [inventoryId]: data.bookings || [] }))
+    } catch (error) {
+      console.error(error)
+      setBookingsById((prev) => ({ ...prev, [inventoryId]: [] }))
+    } finally {
+      setLoadingBookings(null)
+    }
+  }
+
+  const toggleExpand = async (item: InventoryItem) => {
+    const willOpen = !expandedIds.has(item.id)
+    setExpandedIds((prev) => {
+      const next = new Set(prev)
+      if (next.has(item.id)) next.delete(item.id)
+      else next.add(item.id)
+      return next
     })
-    setShowForm(true)
+    if (willOpen && !bookingsById[item.id]) {
+      await loadBookings(item.id)
+    }
+  }
+
+  const openAddQty = (item: InventoryItem) => {
+    setAddQtyId(item.id)
+    setAddQtyForm({
+      order_no: '',
+      product_code: '',
+      qty: '',
+      date: todayLabel(),
+    })
+    setExpandedIds((prev) => new Set(prev).add(item.id))
+    if (!bookingsById[item.id]) loadBookings(item.id)
+  }
+
+  const submitAddQty = async (item: InventoryItem) => {
+    const qty = Number(addQtyForm.qty)
+    if (!Number.isFinite(qty) || qty === 0) {
+      alert('Enter qty to add (e.g. 10)')
+      return
+    }
+    setAdjustingId(item.id)
+    try {
+      const updated = await apiFetch<InventoryItem>(`/api/inventory/${item.id}/add-qty`, {
+        method: 'POST',
+        body: JSON.stringify({
+          qty,
+          order_no: addQtyForm.order_no,
+          product_code: addQtyForm.product_code,
+          date: addQtyForm.date || todayLabel(),
+        }),
+      })
+      setItems((prev) => prev.map((row) => (row.id === item.id ? { ...row, ...updated } : row)))
+      setAddQtyId(null)
+      setAddQtyForm({ order_no: '', product_code: '', qty: '', date: todayLabel() })
+      await loadBookings(item.id)
+    } catch (error) {
+      alert(error instanceof Error ? error.message : 'Failed to add qty')
+    } finally {
+      setAdjustingId(null)
+    }
   }
 
   const openNewForm = () => {
     setIsNewItem(true)
-    setFormData({ id: '', name: '', sku: '', available: '', pending: '', reserved: '', status: 'Normal' })
+    setFormData({ id: '', name: '', available: '' })
     setShowForm(true)
   }
 
-  const openNewCodeForm = () => {
-    setIsNewCode(true)
-    setCodeForm({ id: '', code: '', name: '', description: '', items: [{ inventory_id: items[0]?.id || 0, qty_per_unit: 1 }] })
-    setShowCodeForm(true)
-  }
-
-  const openEditCodeForm = (code: ProductCode) => {
-    setIsNewCode(false)
-    setCodeForm({
-      id: String(code.id),
-      code: code.code,
-      name: code.name,
-      description: code.description || '',
-      items: code.items.map((i) => ({ inventory_id: i.inventory_id, qty_per_unit: i.qty_per_unit })),
+  const openEditForm = (item: InventoryItem) => {
+    setIsNewItem(false)
+    setFormData({
+      id: String(item.id),
+      name: item.name,
+      available: String(item.available),
     })
-    setShowCodeForm(true)
+    setShowForm(true)
   }
 
-  const addCodeItem = () => {
-    setCodeForm({
-      ...codeForm,
-      items: [...codeForm.items, { inventory_id: items[0]?.id || 0, qty_per_unit: 1 }],
-    })
-  }
-
-  const removeCodeItem = (index: number) => {
-    setCodeForm({ ...codeForm, items: codeForm.items.filter((_, i) => i !== index) })
-  }
-
-  const handleSaveCode = async () => {
-    if (!codeForm.code || !codeForm.name || codeForm.items.length === 0) {
-      alert('Code, name, and at least one product are required')
+  const handleSave = async () => {
+    if (!formData.name.trim()) {
+      alert('Inventory name is required')
       return
     }
 
     try {
-      if (isNewCode) {
-        await apiFetch('/api/product-codes', {
-          method: 'POST',
-          body: JSON.stringify({
-            code: codeForm.code,
-            name: codeForm.name,
-            description: codeForm.description,
-            items: codeForm.items,
-          }),
-        })
-      } else {
-        await apiFetch(`/api/product-codes/${codeForm.id}`, {
-          method: 'PUT',
-          body: JSON.stringify({
-            code: codeForm.code,
-            name: codeForm.name,
-            description: codeForm.description,
-            items: codeForm.items,
-          }),
-        })
-      }
-      setShowCodeForm(false)
-      fetchAll()
-    } catch (error) {
-      alert(error instanceof Error ? error.message : 'Failed to save product code')
-    }
-  }
-
-  const handleDeleteCode = async (id: number) => {
-    if (!confirm('Delete this product code?')) return
-    try {
-      await apiFetch(`/api/product-codes/${id}`, { method: 'DELETE' })
-      fetchAll()
-    } catch (error) {
-      alert(error instanceof Error ? error.message : 'Failed to delete')
-    }
-  }
-
-  const handleSave = async () => {
-    if (isNewItem) {
-      if (!formData.name || !formData.sku) {
-        alert('Name and SKU are required')
-        return
-      }
-      try {
+      if (isNewItem) {
         await apiFetch('/api/inventory', {
           method: 'POST',
           body: JSON.stringify({
             name: formData.name,
-            sku: formData.sku,
-            available: formData.available,
-            pending: formData.pending,
-            reserved: formData.reserved,
-            status: formData.status,
+            available: Number(formData.available) || 0,
+            pending: 0,
+            reserved: 0,
           }),
         })
-        setShowForm(false)
-        fetchAll()
-      } catch (error) {
-        alert(error instanceof Error ? error.message : 'Failed to add inventory item')
+      } else {
+        const item = items.find((i) => String(i.id) === formData.id)
+        const editInfo = getEditWindowInfo(role, item?.created_at, item?.created_by, user?.id)
+        if (!editInfo.canEdit && role !== 'admin') {
+          alert('48-hour edit window expired. Contact admin.')
+          return
+        }
+        await apiFetch(`/api/inventory/${formData.id}`, {
+          method: 'PUT',
+          body: JSON.stringify({
+            name: formData.name,
+            available: Number(formData.available) || 0,
+          }),
+        })
       }
-      return
-    }
-
-    if (!formData.id || !formData.available || !formData.pending || !formData.reserved) {
-      alert('Please fill all fields')
-      return
-    }
-
-    try {
-      await apiFetch(`/api/inventory/${formData.id}`, {
-        method: 'PUT',
-        body: JSON.stringify({
-          available: parseInt(formData.available),
-          pending: parseInt(formData.pending),
-          reserved: parseInt(formData.reserved),
-          status: formData.status,
-        }),
-      })
       setShowForm(false)
-      fetchAll()
+      fetchItems()
+      alert(isNewItem ? 'Inventory saved.' : 'Inventory updated.')
     } catch (error) {
-      alert(error instanceof Error ? error.message : 'Failed to update inventory')
+      alert(error instanceof Error ? error.message : 'Failed to save inventory')
+    }
+  }
+
+  const adjustQty = async (item: InventoryItem, delta: number) => {
+    if (!canAdjust) return
+    setAdjustingId(item.id)
+    try {
+      const updated = await apiFetch<InventoryItem>(`/api/inventory/${item.id}/adjust`, {
+        method: 'POST',
+        body: JSON.stringify({ delta }),
+      })
+      setItems((prev) => prev.map((row) => (row.id === item.id ? { ...row, ...updated } : row)))
+    } catch (error) {
+      alert(error instanceof Error ? error.message : 'Failed to adjust qty')
+    } finally {
+      setAdjustingId(null)
     }
   }
 
   const handleExport = () => {
-    downloadCsv(
-      'inventory.csv',
-      ['Name', 'SKU', 'Available', 'Pending', 'Reserved', 'Status'],
-      items.map((i) => [i.name, i.sku, i.available, i.pending, i.reserved, i.status])
+    downloadExcel(
+      'inventory.xlsx',
+      'Inventory',
+      [
+        { header: 'Inventory' },
+        { header: 'Qty Available', type: 'number' },
+        { header: 'Booked (Orders)', type: 'number' },
+        { header: 'Monthly Avg', type: 'number' },
+        { header: 'Status' },
+      ],
+      items.map((i) => [i.name, i.available, i.booked ?? i.pending ?? 0, i.monthly_avg ?? 0, i.status])
     )
   }
 
   const handleImport = async (rows: Record<string, string>[]) => {
-    const result = await apiFetch<{ imported: number; total: number; errors: string[] }>('/api/inventory/import', {
-      method: 'POST',
-      body: JSON.stringify({ rows }),
-    })
-    alert(`Imported ${result.imported} of ${result.total} rows${result.errors.length ? `\nErrors: ${result.errors.slice(0, 3).join(', ')}` : ''}`)
-    fetchAll()
+    const result = await apiFetch<{ imported: number; total: number; skipped?: number; errors: string[] }>(
+      '/api/inventory/import',
+      {
+        method: 'POST',
+        body: JSON.stringify({ rows, namesOnly: true }),
+      }
+    )
+    alert(
+      `Imported ${result.imported} of ${result.total} (Particulars only)` +
+        (result.skipped ? `\nSkipped: ${result.skipped}` : '') +
+        (result.errors.length ? `\nErrors: ${result.errors.slice(0, 3).join(', ')}` : '')
+    )
+    fetchItems()
   }
+
+  const handleStkSumImport = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    if (!file) return
+    setStkImporting(true)
+    try {
+      const rows = await parseStkSumExcel(file)
+      if (rows.length === 0) {
+        alert('No Particulars found in this Excel file')
+        return
+      }
+      await handleImport(rows)
+    } catch (error) {
+      alert(error instanceof Error ? error.message : 'Failed to import StkSum Excel')
+    } finally {
+      setStkImporting(false)
+      if (stkFileRef.current) stkFileRef.current.value = ''
+    }
+  }
+
+  const filtered = items.filter((item) => {
+    if (!search.trim()) return true
+    return item.name.toLowerCase().includes(search.toLowerCase())
+  })
 
   const statusStyles: Record<string, string> = {
     Normal: 'bg-emerald-50 text-emerald-700',
     'Low Stock': 'bg-amber-50 text-amber-700',
+    Defect: 'bg-rose-50 text-rose-700',
     Critical: 'bg-rose-50 text-rose-700',
   }
 
-  const getStockStatus = (code: ProductCode) => {
-    for (const item of code.items) {
-      if ((item.available ?? 0) === 0) return 'Out of Stock'
-      if ((item.available ?? 0) < item.qty_per_unit) return 'Low Stock'
-    }
-    return 'In Stock'
-  }
+  const bookedOf = (item: InventoryItem) => item.booked ?? item.pending ?? 0
 
   return (
     <div className="space-y-6">
-      <div className="flex items-center justify-between">
+      <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
           <h1 className="text-2xl font-semibold text-slate-900">Inventory</h1>
-          <p className="mt-1 text-sm text-slate-500">Manage product codes with bundled items. Inventory users can edit stock within 48 hours of adding.</p>
+          <p className="mt-1 text-sm text-slate-500">
+            Click + to see order bookings. Use Add Qty to stock in with order / product code / date.
+          </p>
         </div>
-        <div className="flex gap-3">
+        <div className="flex flex-wrap gap-3">
           <button onClick={() => setShowFilter(!showFilter)} className="flex items-center gap-2 rounded-xl border border-slate-300 px-4 py-2.5 font-medium text-slate-700 transition hover:bg-slate-50">
             <Filter className="h-4 w-4" />
             Filter
@@ -273,21 +308,37 @@ export default function Inventory() {
               Export
             </button>
           )}
-          <ImportCsvButton onImport={handleImport} />
-          <button onClick={tab === 'codes' ? openNewCodeForm : openNewForm} className="flex items-center gap-2 rounded-xl bg-blue-600 px-4 py-2.5 font-medium text-white transition hover:bg-blue-700">
+          <ImportCsvButton onImport={handleImport} label="Import CSV" />
+          <input
+            ref={stkFileRef}
+            type="file"
+            accept=".xlsx,.xls,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            className="hidden"
+            onChange={handleStkSumImport}
+          />
+          <button
+            type="button"
+            onClick={() => stkFileRef.current?.click()}
+            disabled={stkImporting}
+            className="flex items-center gap-2 rounded-xl border border-slate-300 px-4 py-2.5 font-medium text-slate-700 transition hover:bg-slate-50 disabled:opacity-60"
+          >
+            <Upload className="h-4 w-4" />
+            {stkImporting ? 'Importing...' : 'Import StkSum Excel'}
+          </button>
+          <button onClick={openNewForm} className="flex items-center gap-2 rounded-xl bg-blue-600 px-4 py-2.5 font-medium text-white transition hover:bg-blue-700">
             <Plus className="h-4 w-4" />
-            {tab === 'codes' ? 'Add Product Code' : 'Add Stock Item'}
+            Add Inventory
           </button>
         </div>
       </div>
 
-      <div className="flex gap-2">
-        <button onClick={() => setTab('codes')} className={`rounded-xl px-4 py-2 text-sm font-medium transition ${tab === 'codes' ? 'bg-blue-600 text-white' : 'border border-slate-300 text-slate-700 hover:bg-slate-50'}`}>
-          Product Codes
-        </button>
-        <button onClick={() => setTab('stock')} className={`rounded-xl px-4 py-2 text-sm font-medium transition ${tab === 'stock' ? 'bg-blue-600 text-white' : 'border border-slate-300 text-slate-700 hover:bg-slate-50'}`}>
-          Stock Items
-        </button>
+      <div className="flex flex-wrap gap-3">
+        <input
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+          placeholder="Search inventory name..."
+          className="min-w-[240px] flex-1 rounded-xl border border-slate-300 px-3 py-2 text-sm outline-none focus:border-blue-500"
+        />
       </div>
 
       {showFilter && (
@@ -297,209 +348,271 @@ export default function Inventory() {
             <option value="">All Statuses</option>
             <option value="Normal">Normal</option>
             <option value="Low Stock">Low Stock</option>
-            <option value="Critical">Critical</option>
+            <option value="Defect">Defect</option>
           </select>
-        </div>
-      )}
-
-      {showCodeForm && (
-        <div className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
-          <h2 className="mb-4 text-lg font-semibold text-slate-900">{isNewCode ? 'Add Product Code' : 'Edit Product Code'}</h2>
-          <div className="grid gap-4 md:grid-cols-2">
-            <input type="text" placeholder="Product Code (e.g. BRK-001)" value={codeForm.code} onChange={(e) => setCodeForm({ ...codeForm, code: e.target.value.toUpperCase() })} className="rounded-xl border border-slate-300 px-3 py-2 outline-none focus:border-blue-500" />
-            <input type="text" placeholder="Name (e.g. Barrier Kit)" value={codeForm.name} onChange={(e) => setCodeForm({ ...codeForm, name: e.target.value })} className="rounded-xl border border-slate-300 px-3 py-2 outline-none focus:border-blue-500" />
-            <input type="text" placeholder="Description" value={codeForm.description} onChange={(e) => setCodeForm({ ...codeForm, description: e.target.value })} className="md:col-span-2 rounded-xl border border-slate-300 px-3 py-2 outline-none focus:border-blue-500" />
-          </div>
-
-          <div className="mt-4">
-            <div className="mb-2 flex items-center justify-between">
-              <label className="text-sm font-medium text-slate-700">Products inside this code</label>
-              <button onClick={addCodeItem} className="text-sm font-medium text-blue-600 hover:text-blue-700">+ Add Product</button>
-            </div>
-            <div className="space-y-2">
-              {codeForm.items.map((item, index) => (
-                <div key={index} className="flex items-center gap-2">
-                  <select value={item.inventory_id} onChange={(e) => {
-                    const next = [...codeForm.items]
-                    next[index] = { ...next[index], inventory_id: Number(e.target.value) }
-                    setCodeForm({ ...codeForm, items: next })
-                  }} className="flex-1 rounded-xl border border-slate-300 px-3 py-2 outline-none focus:border-blue-500">
-                    {items.map((inv) => (
-                      <option key={inv.id} value={inv.id}>{inv.name} ({inv.sku}) — {inv.available} avail</option>
-                    ))}
-                  </select>
-                  <span className="text-slate-500">×</span>
-                  <input type="number" min={1} value={item.qty_per_unit} onChange={(e) => {
-                    const next = [...codeForm.items]
-                    next[index] = { ...next[index], qty_per_unit: Number(e.target.value) || 1 }
-                    setCodeForm({ ...codeForm, items: next })
-                  }} className="w-20 rounded-xl border border-slate-300 px-3 py-2 outline-none focus:border-blue-500" />
-                  {codeForm.items.length > 1 && (
-                    <button onClick={() => removeCodeItem(index)} className="rounded-lg p-2 text-rose-600 hover:bg-rose-50">
-                      <Trash2 className="h-4 w-4" />
-                    </button>
-                  )}
-                </div>
-              ))}
-            </div>
-          </div>
-
-          <div className="mt-4 flex gap-2">
-            <button onClick={handleSaveCode} className="rounded-xl bg-blue-600 px-4 py-2 font-medium text-white transition hover:bg-blue-700">{isNewCode ? 'Create' : 'Save'}</button>
-            <button onClick={() => setShowCodeForm(false)} className="rounded-xl border border-slate-300 px-4 py-2 font-medium text-slate-700 transition hover:bg-slate-50">Cancel</button>
-          </div>
         </div>
       )}
 
       {showForm && (
         <div className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
-          <h2 className="mb-4 text-lg font-semibold text-slate-900">{isNewItem ? 'Add Stock Item' : 'Update Stock'}</h2>
+          <h2 className="mb-4 text-lg font-semibold text-slate-900">{isNewItem ? 'Add Inventory' : 'Update Inventory'}</h2>
           <div className="grid gap-4 md:grid-cols-2">
-            {isNewItem ? (
-              <>
-                <input type="text" placeholder="Product Name" value={formData.name} onChange={(e) => setFormData({...formData, name: e.target.value})} className="rounded-xl border border-slate-300 px-3 py-2 outline-none focus:border-blue-500" />
-                <input type="text" placeholder="SKU" value={formData.sku} onChange={(e) => setFormData({...formData, sku: e.target.value})} className="rounded-xl border border-slate-300 px-3 py-2 outline-none focus:border-blue-500" />
-              </>
-            ) : (
-              <div className="md:col-span-2 text-sm text-slate-600">
-                Editing: <strong>{formData.name}</strong> ({formData.sku})
-                {formData.id && items.find((i) => String(i.id) === formData.id) && (
-                  <EditWindowBadge
-                    role={role}
-                    createdAt={items.find((i) => String(i.id) === formData.id)?.created_at}
-                    createdBy={items.find((i) => String(i.id) === formData.id)?.created_by}
-                    userId={user?.id}
-                  />
-                )}
-              </div>
-            )}
-            <input type="number" placeholder="Available" value={formData.available} onChange={(e) => setFormData({...formData, available: e.target.value})} className="rounded-xl border border-slate-300 px-3 py-2 outline-none focus:border-blue-500" />
-            <input type="number" placeholder="Pending" value={formData.pending} onChange={(e) => setFormData({...formData, pending: e.target.value})} className="rounded-xl border border-slate-300 px-3 py-2 outline-none focus:border-blue-500" />
-            <input type="number" placeholder="Reserved" value={formData.reserved} onChange={(e) => setFormData({...formData, reserved: e.target.value})} className="rounded-xl border border-slate-300 px-3 py-2 outline-none focus:border-blue-500" />
-            <select value={formData.status} onChange={(e) => setFormData({...formData, status: e.target.value})} className="rounded-xl border border-slate-300 px-3 py-2 outline-none focus:border-blue-500">
-              <option value="Normal">Normal</option>
-              <option value="Low Stock">Low Stock</option>
-              <option value="Critical">Critical</option>
-            </select>
+            <div>
+              <label className="mb-1 block text-sm font-medium text-slate-700">Inventory</label>
+              <input
+                type="text"
+                placeholder="e.g. MCB 32A"
+                value={formData.name}
+                onChange={(e) => setFormData({ ...formData, name: e.target.value })}
+                className="w-full rounded-xl border border-slate-300 px-3 py-2 outline-none focus:border-blue-500"
+              />
+            </div>
+            <div>
+              <label className="mb-1 block text-sm font-medium text-slate-700">Qty Available</label>
+              <input
+                type="number"
+                placeholder="Free stock qty"
+                value={formData.available}
+                onChange={(e) => setFormData({ ...formData, available: e.target.value })}
+                className="w-full rounded-xl border border-slate-300 px-3 py-2 outline-none focus:border-blue-500"
+              />
+            </div>
           </div>
-          <div className="mt-4 flex gap-2">
-            <button onClick={handleSave} className="rounded-xl bg-blue-600 px-4 py-2 font-medium text-white transition hover:bg-blue-700">{isNewItem ? 'Add' : 'Update'}</button>
-            <button onClick={() => setShowForm(false)} className="rounded-xl border border-slate-300 px-4 py-2 font-medium text-slate-700 transition hover:bg-slate-50">Cancel</button>
-          </div>
-        </div>
-      )}
-
-      {loading ? (
-        <div className="text-center text-slate-500">Loading inventory...</div>
-      ) : tab === 'codes' ? (
-        <div className="grid gap-6 lg:grid-cols-2">
-          {productCodes.map((code) => {
-            const stockStatus = getStockStatus(code)
-            const stockStyle = stockStatus === 'Out of Stock' ? 'bg-rose-50 text-rose-700' : stockStatus === 'Low Stock' ? 'bg-amber-50 text-amber-700' : 'bg-emerald-50 text-emerald-700'
-            return (
-              <div key={code.id} className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
-                <div className="flex items-start justify-between">
-                  <div className="flex items-start gap-3">
-                    <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-blue-50 text-blue-600">
-                      <Package className="h-5 w-5" />
-                    </div>
-                    <div>
-                      <h3 className="font-semibold text-slate-900">{code.name}</h3>
-                      <p className="text-sm font-mono text-blue-600">{code.code}</p>
-                      {code.description && <p className="mt-1 text-xs text-slate-500">{code.description}</p>}
-                    </div>
-                  </div>
-                  <span className={`rounded-full px-2.5 py-1 text-xs font-semibold ${stockStyle}`}>{stockStatus}</span>
-                </div>
-
-                <div className="mt-4 rounded-xl bg-slate-50 p-3">
-                  <p className="mb-2 text-xs font-semibold uppercase text-slate-400">Contains (per unit)</p>
-                  <div className="space-y-1">
-                    {code.items.map((item) => (
-                      <div key={item.inventory_id} className="flex items-center justify-between text-sm">
-                        <span className="text-slate-700">{item.name} × {item.qty_per_unit}</span>
-                        <span className={`text-xs ${(item.available ?? 0) < item.qty_per_unit ? 'font-semibold text-rose-600' : 'text-slate-500'}`}>
-                          {item.available ?? 0} avail
-                        </span>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-
-                {stockStatus !== 'In Stock' && (
-                  <div className="mt-3 flex items-center gap-2 rounded-lg bg-amber-50 p-3 text-sm text-amber-700">
-                    <AlertTriangle className="h-4 w-4 shrink-0" />
-                    {stockStatus === 'Out of Stock' ? 'Some items are out of stock' : 'Insufficient stock for full kit'}
-                  </div>
-                )}
-
-                <div className="mt-4 flex gap-2">
-                  <button onClick={() => openEditCodeForm(code)} className="flex flex-1 items-center justify-center gap-1 rounded-xl border border-slate-300 px-4 py-2 text-sm font-medium text-slate-700 transition hover:bg-slate-50">
-                    <Pencil className="h-3.5 w-3.5" /> Edit
-                  </button>
-                  {canRemove && (
-                    <button onClick={() => handleDeleteCode(code.id)} className="rounded-xl border border-rose-200 bg-rose-50 px-4 py-2 text-sm font-medium text-rose-600 transition hover:bg-rose-100">
-                      <Trash2 className="h-3.5 w-3.5" />
-                    </button>
-                  )}
-                </div>
-              </div>
-            )
-          })}
-          {productCodes.length === 0 && (
-            <div className="col-span-2 rounded-2xl border border-dashed border-slate-300 p-8 text-center text-slate-500">
-              No product codes yet. Add stock items first, then create a product code.
+          {!isNewItem && (
+            <div className="mt-3">
+              <EditWindowBadge
+                role={role}
+                createdAt={items.find((i) => String(i.id) === formData.id)?.created_at}
+                createdBy={items.find((i) => String(i.id) === formData.id)?.created_by}
+                userId={user?.id}
+              />
             </div>
           )}
-        </div>
-      ) : (
-        <div className="grid gap-6 lg:grid-cols-2">
-          {items.map((item) => {
-            const editInfo = getEditWindowInfo(role, item.created_at, item.created_by, user?.id)
-            return (
-            <div key={item.id} className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
-              <div className="flex items-start justify-between">
-                <div>
-                  <h3 className="font-semibold text-slate-900">{item.name}</h3>
-                  <p className="text-sm text-slate-500">{item.sku}</p>
-                  {item.created_at && (
-                    <p className="mt-1 text-xs text-slate-400">Added: {new Date(item.created_at).toLocaleString('en-IN')}</p>
-                  )}
-                </div>
-                <span className={`rounded-full px-2.5 py-1 text-xs font-semibold ${statusStyles[item.status]}`}>{item.status}</span>
-              </div>
-              <div className="mt-4 grid grid-cols-3 gap-3">
-                <div className="rounded-xl bg-emerald-50 p-3 text-center">
-                  <p className="text-xs text-slate-500">Available</p>
-                  <p className="mt-1 text-xl font-semibold text-emerald-600">{item.available}</p>
-                </div>
-                <div className="rounded-xl bg-amber-50 p-3 text-center">
-                  <p className="text-xs text-slate-500">Pending</p>
-                  <p className="mt-1 text-xl font-semibold text-amber-600">{item.pending}</p>
-                </div>
-                <div className="rounded-xl bg-blue-50 p-3 text-center">
-                  <p className="text-xs text-slate-500">Reserved</p>
-                  <p className="mt-1 text-xl font-semibold text-blue-600">{item.reserved}</p>
-                </div>
-              </div>
-              {item.status === 'Low Stock' && (
-                <div className="mt-4 flex items-center gap-2 rounded-lg bg-amber-50 p-3 text-sm text-amber-700">
-                  <AlertTriangle className="h-4 w-4" />
-                  Reorder soon to maintain stock levels
-                </div>
-              )}
-              <EditWindowBadge role={role} createdAt={item.created_at} createdBy={item.created_by} userId={user?.id} />
-              <button
-                onClick={() => editInfo.canEdit ? openUpdateForm(item) : alert('48-hour edit window expired. Contact admin.')}
-                disabled={!editInfo.canEdit && role !== 'admin'}
-                className="mt-4 w-full rounded-xl border border-slate-300 px-4 py-2 text-sm font-medium text-slate-700 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
-              >
-                {editInfo.canEdit ? 'Update Stock' : 'Edit locked (48h expired)'}
-              </button>
-            </div>
-          )})}
+          <div className="mt-4 flex gap-2">
+            <button onClick={handleSave} className="rounded-xl bg-blue-600 px-4 py-2 font-medium text-white transition hover:bg-blue-700">
+              {isNewItem ? 'Create' : 'Save'}
+            </button>
+            <button onClick={() => setShowForm(false)} className="rounded-xl border border-slate-300 px-4 py-2 font-medium text-slate-700 transition hover:bg-slate-50">
+              Cancel
+            </button>
+          </div>
         </div>
       )}
+
+      <div className="overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm">
+        <table className="w-full text-left text-sm">
+          <thead className="border-b border-slate-200 bg-slate-50 text-slate-600">
+            <tr>
+              <th className="w-10 px-3 py-3 font-medium" />
+              <th className="px-4 py-3 font-medium">Inventory</th>
+              <th className="px-4 py-3 font-medium">Qty Available</th>
+              <th className="px-4 py-3 font-medium">Booked (Orders)</th>
+              <th className="px-4 py-3 font-medium">Monthly Avg</th>
+              <th className="px-4 py-3 font-medium">Status</th>
+              <th className="px-4 py-3 font-medium">Action</th>
+            </tr>
+          </thead>
+          <tbody>
+            {loading ? (
+              <tr>
+                <td colSpan={7} className="px-4 py-8 text-center text-slate-500">
+                  Loading inventory...
+                </td>
+              </tr>
+            ) : filtered.length === 0 ? (
+              <tr>
+                <td colSpan={7} className="px-4 py-8 text-center text-slate-500">
+                  No inventory items yet. Click Add Inventory.
+                </td>
+              </tr>
+            ) : (
+              filtered.map((item) => {
+                const low = item.available <= 0
+                const booked = bookedOf(item)
+                const busy = adjustingId === item.id
+                const expanded = expandedIds.has(item.id)
+                const bookings = bookingsById[item.id] || []
+                const showAdd = addQtyId === item.id
+                return (
+                  <Fragment key={item.id}>
+                    <tr className="border-b border-slate-100">
+                      <td className="px-3 py-3">
+                        <button
+                          type="button"
+                          onClick={() => toggleExpand(item)}
+                          className="inline-flex h-7 w-7 items-center justify-center rounded-lg border border-slate-200 text-slate-600 hover:bg-slate-100"
+                          title={expanded ? 'Hide bookings' : 'Show order bookings'}
+                        >
+                          {expanded ? <Minus className="h-3.5 w-3.5" /> : <Plus className="h-3.5 w-3.5" />}
+                        </button>
+                      </td>
+                      <td className="px-4 py-3">
+                        <p className="font-medium text-slate-900">{item.name}</p>
+                      </td>
+                      <td className="px-4 py-3">
+                        <div className="inline-flex items-center gap-1.5">
+                          {canAdjust && (
+                            <button
+                              type="button"
+                              disabled={busy}
+                              onClick={() => adjustQty(item, -1)}
+                              className="rounded-lg border border-slate-200 p-1 text-slate-600 hover:bg-slate-50 disabled:opacity-50"
+                              title="Subtract 1"
+                            >
+                              <Minus className="h-3.5 w-3.5" />
+                            </button>
+                          )}
+                          <span className={`min-w-[2rem] text-center font-semibold tabular-nums ${low ? 'text-rose-600' : 'text-slate-900'}`}>
+                            {item.available}
+                          </span>
+                          {canAdjust && (
+                            <button
+                              type="button"
+                              disabled={busy}
+                              onClick={() => adjustQty(item, 1)}
+                              className="rounded-lg border border-slate-200 p-1 text-slate-600 hover:bg-slate-50 disabled:opacity-50"
+                              title="Add 1"
+                            >
+                              <Plus className="h-3.5 w-3.5" />
+                            </button>
+                          )}
+                        </div>
+                      </td>
+                      <td className="px-4 py-3 font-medium tabular-nums text-amber-700">{booked}</td>
+                      <td className="px-4 py-3 text-slate-700">{Number(item.monthly_avg || 0).toFixed(1)}</td>
+                      <td className="px-4 py-3">
+                        <span className={`rounded-full px-2.5 py-1 text-xs font-semibold ${statusStyles[item.status] || 'bg-slate-100 text-slate-600'}`}>
+                          {item.status}
+                        </span>
+                      </td>
+                      <td className="px-4 py-3">
+                        <div className="flex flex-wrap gap-1.5">
+                          {canAdjust && (
+                            <button
+                              type="button"
+                              onClick={() => openAddQty(item)}
+                              className="inline-flex items-center gap-1 rounded-lg bg-emerald-50 px-2.5 py-1.5 text-xs font-medium text-emerald-700 hover:bg-emerald-100"
+                            >
+                              <Plus className="h-3.5 w-3.5" /> Add Qty
+                            </button>
+                          )}
+                          <button
+                            onClick={() => openEditForm(item)}
+                            className="inline-flex items-center gap-1 rounded-lg border border-slate-200 px-2.5 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50"
+                          >
+                            <Pencil className="h-3.5 w-3.5" /> Edit
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+
+                    {expanded && (
+                      <tr className="bg-slate-50/80">
+                        <td colSpan={7} className="px-4 py-3">
+                          <div className="space-y-3">
+                            {showAdd && canAdjust && (
+                              <div className="rounded-xl border border-emerald-200 bg-white p-4">
+                                <p className="mb-3 text-sm font-semibold text-slate-900">Add Qty — {item.name}</p>
+                                <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+                                  <div>
+                                    <label className="mb-1 block text-xs text-slate-500">Order No</label>
+                                    <input
+                                      value={addQtyForm.order_no}
+                                      onChange={(e) => setAddQtyForm({ ...addQtyForm, order_no: e.target.value })}
+                                      placeholder="Optional"
+                                      className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm outline-none focus:border-blue-500"
+                                    />
+                                  </div>
+                                  <div>
+                                    <label className="mb-1 block text-xs text-slate-500">Product Code</label>
+                                    <input
+                                      value={addQtyForm.product_code}
+                                      onChange={(e) => setAddQtyForm({ ...addQtyForm, product_code: e.target.value })}
+                                      placeholder="Optional"
+                                      className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm outline-none focus:border-blue-500"
+                                    />
+                                  </div>
+                                  <div>
+                                    <label className="mb-1 block text-xs text-slate-500">Qty</label>
+                                    <input
+                                      type="number"
+                                      value={addQtyForm.qty}
+                                      onChange={(e) => setAddQtyForm({ ...addQtyForm, qty: e.target.value })}
+                                      placeholder="Enter qty"
+                                      className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm outline-none focus:border-blue-500"
+                                    />
+                                  </div>
+                                  <div>
+                                    <label className="mb-1 block text-xs text-slate-500">Date</label>
+                                    <input
+                                      value={addQtyForm.date}
+                                      onChange={(e) => setAddQtyForm({ ...addQtyForm, date: e.target.value })}
+                                      className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm outline-none focus:border-blue-500"
+                                    />
+                                  </div>
+                                </div>
+                                <div className="mt-3 flex gap-2">
+                                  <button
+                                    type="button"
+                                    disabled={busy}
+                                    onClick={() => submitAddQty(item)}
+                                    className="rounded-lg bg-emerald-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-emerald-700 disabled:opacity-50"
+                                  >
+                                    Save Qty
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => setAddQtyId(null)}
+                                    className="rounded-lg border border-slate-300 px-3 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-50"
+                                  >
+                                    Cancel
+                                  </button>
+                                </div>
+                              </div>
+                            )}
+
+                            <div className="overflow-hidden rounded-xl border border-slate-200 bg-white">
+                              <p className="border-b border-slate-100 bg-slate-50 px-3 py-2 text-xs font-semibold uppercase tracking-wide text-slate-500">
+                                Bookings / stock moves — {item.name}
+                              </p>
+                              {loadingBookings === item.id ? (
+                                <p className="px-3 py-4 text-sm text-slate-500">Loading…</p>
+                              ) : bookings.length === 0 ? (
+                                <p className="px-3 py-4 text-sm text-slate-500">No orders or qty adds yet for this item.</p>
+                              ) : (
+                                <table className="w-full text-left text-sm">
+                                  <thead className="border-b border-slate-100 text-xs uppercase tracking-wide text-slate-500">
+                                    <tr>
+                                      <th className="px-3 py-2 font-semibold">Order No</th>
+                                      <th className="px-3 py-2 font-semibold">Product Code</th>
+                                      <th className="px-3 py-2 font-semibold">Qty</th>
+                                      <th className="px-3 py-2 font-semibold">Date</th>
+                                    </tr>
+                                  </thead>
+                                  <tbody>
+                                    {bookings.map((b, idx) => (
+                                      <tr key={`${item.id}-${b.order_no}-${b.product_code}-${idx}`} className="border-b border-slate-50 last:border-0">
+                                        <td className="px-3 py-2 font-medium text-slate-900">{b.order_no}</td>
+                                        <td className="px-3 py-2 font-mono font-semibold text-blue-700">{b.product_code}</td>
+                                        <td className="px-3 py-2 tabular-nums text-slate-800">{b.qty}</td>
+                                        <td className="px-3 py-2 text-slate-600">{b.date}</td>
+                                      </tr>
+                                    ))}
+                                  </tbody>
+                                </table>
+                              )}
+                            </div>
+                          </div>
+                        </td>
+                      </tr>
+                    )}
+                  </Fragment>
+                )
+              })
+            )}
+          </tbody>
+        </table>
+      </div>
     </div>
   )
 }

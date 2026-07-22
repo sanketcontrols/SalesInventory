@@ -117,37 +117,73 @@ server {
 
 ---
 
-## Option 3: Cloud platforms
+## Option 3: Deploy on Render (recommended cloud)
 
-### Render / Railway (backend + PostgreSQL)
-1. Create a **PostgreSQL** database on the platform.
-2. Create a **Web Service** from this repo.
-3. Set environment variables:
-   - `NODE_ENV=production`
-   - `PORT=5000`
-   - `DATABASE_URL` or `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD`
-   - `JWT_SECRET`
-4. **Build command:**
+Use **one Web Service** (UI + API) + **one PostgreSQL**. Tables are created automatically on first start.
+
+### A. PostgreSQL
+
+1. [dashboard.render.com](https://dashboard.render.com) → **New** → **PostgreSQL**
+2. Name e.g. `billing-db`, same region you will use for the app
+3. Create → wait until **Available**
+4. Copy the **Internal Database URL**
+
+### B. Web Service
+
+1. **New** → **Web Service** → connect GitHub repo
+2. Runtime: **Node**
+3. Root Directory: leave empty
+4. **Build Command:**
    ```bash
    cd frontend && npm ci && npm run build && mkdir -p ../backend/public && cp -r dist/* ../backend/public/ && cd ../backend && npm ci --omit=dev
    ```
-5. **Start command:**
+5. **Start Command:**
    ```bash
    cd backend && node server.js
    ```
 
-### Separate frontend (Vercel/Netlify) + API (Render)
-Only if you want frontend and API on different URLs.
+### C. Environment variables
 
-1. Deploy backend as above.
-2. Deploy frontend with build env:
-   ```env
-   VITE_API_URL=https://your-api.onrender.com
-   ```
-3. Set backend CORS:
-   ```env
-   CORS_ORIGIN=https://your-frontend.vercel.app
-   ```
+| Key | Value |
+|-----|--------|
+| `NODE_ENV` | `production` |
+| `DATABASE_URL` | Internal Database URL from step A |
+| `JWT_SECRET` | Long random secret (32+ characters) |
+| `DB_SSL` | `true` |
+
+Do **not** set `PORT` — Render provides it.
+
+### D. After deploy
+
+1. Open `https://YOUR-SERVICE.onrender.com`
+2. Health check: `/api/health` → `{"status":"ok","database":"connected"}`
+3. Login (first empty DB):
+   - Email: `harsh@gmail.com`
+   - Password: `123456`
+4. Change password in Settings immediately
+
+### E. Optional: copy local data to Render
+
+```bash
+pg_dump -h localhost -p 5433 -U postgres -d harsh -F c -f billing_backup.dump
+```
+
+Restore into Render using the **External Database URL** with `pg_restore` or a GUI (DBeaver / pgAdmin).
+
+### F. Troubleshooting on Render
+
+| Problem | Fix |
+|---------|-----|
+| DB / SSL errors | `DB_SSL=true` + Internal `DATABASE_URL` |
+| Blank page | Confirm build copies into `backend/public` |
+| Slow first load | Free tier sleeps; wait ~30s or upgrade |
+| CORS errors | Only if UI is on another domain — set `CORS_ORIGIN` |
+
+### Separate frontend (Vercel) + API (Render)
+
+1. Deploy backend as above  
+2. Frontend build env: `VITE_API_URL=https://your-api.onrender.com`  
+3. Backend env: `CORS_ORIGIN=https://your-frontend.vercel.app`
 
 ---
 
@@ -163,6 +199,7 @@ Only if you want frontend and API on different URLs.
 | `DB_USER` | Yes | Database user |
 | `DB_PASSWORD` | Yes | Database password |
 | `JWT_SECRET` | Yes | Secret for login tokens — use a strong random value |
+| `DB_SSL` | Recommended on Render | Set `true` for managed Postgres (Render, etc.) |
 | `CORS_ORIGIN` | No | Only if frontend is on a different domain |
 | `VITE_API_URL` | No | Frontend build only; empty when API is same origin |
 

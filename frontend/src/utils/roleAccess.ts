@@ -4,10 +4,10 @@ export const ROUTES = {
   dashboard: '/',
   orders: '/orders',
   customers: '/customers',
+  companyProfile: '/company-profile',
   products: '/products',
   inventory: '/inventory',
   reports: '/reports',
-  companyProfile: '/company-profile',
   settings: '/settings',
   adminUsers: '/admin/users',
 } as const
@@ -17,10 +17,10 @@ const ROLE_PATHS: Record<'admin' | 'sales' | 'inventory', string[]> = {
     ROUTES.dashboard,
     ROUTES.orders,
     ROUTES.customers,
+    ROUTES.companyProfile,
     ROUTES.products,
     ROUTES.inventory,
     ROUTES.reports,
-    ROUTES.companyProfile,
     ROUTES.settings,
     ROUTES.adminUsers,
   ],
@@ -31,7 +31,7 @@ const ROLE_PATHS: Record<'admin' | 'sales' | 'inventory', string[]> = {
     ROUTES.companyProfile,
     ROUTES.settings,
   ],
-  inventory: [ROUTES.inventory, ROUTES.settings],
+  inventory: [ROUTES.inventory, ROUTES.products, ROUTES.settings],
 }
 
 export function getHomePath(role?: AppRole): string {

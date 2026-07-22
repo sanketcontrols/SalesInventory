@@ -1,8 +1,8 @@
-import { Save, Building2, Calendar, MapPin, Hash, Mail, Phone, Search } from 'lucide-react'
-import { useEffect, useState } from 'react'
-import { Link } from 'react-router-dom'
+import { Save, Building2, Calendar, MapPin, Hash, Mail, Phone, Search, Plus, Minus } from 'lucide-react'
+import { Fragment, useEffect, useState } from 'react'
+import { Link, useSearchParams } from 'react-router-dom'
 import { apiFetch, getStoredUser } from '../services/api'
-import { ensureRupee } from '../utils/formatRupee'
+import { ensureRupee, formatRupee } from '../utils/formatRupee'
 
 interface CustomerCompany {
   id: number
@@ -22,6 +22,18 @@ interface OrderStats {
   pendingOrders: number
   completedOrders: number
   ordersThisMonth: number
+  totalRevenue?: string
+  filteredRevenue?: string
+  filteredOrders?: number
+}
+
+interface OrderItem {
+  product_code?: string
+  product_name?: string
+  description?: string
+  qty: number
+  unit_price?: string
+  amount?: string
 }
 
 interface OrderRow {
@@ -35,12 +47,18 @@ interface OrderRow {
   status: string
   product_code?: string
   product_name?: string
+  no_of_days?: number
+  closing_date?: string | null
+  closed_at?: string | null
+  ok_to_mfg?: boolean
+  items?: OrderItem[]
 }
 
 export default function CompanyProfile() {
   const role = getStoredUser()?.role
   const isAdmin = role === 'admin'
   const canAccess = role === 'admin' || role === 'sales'
+  const [searchParams, setSearchParams] = useSearchParams()
 
   const [companies, setCompanies] = useState<CustomerCompany[]>([])
   const [selectedId, setSelectedId] = useState<number | null>(null)
@@ -49,9 +67,10 @@ export default function CompanyProfile() {
   const [editForm, setEditForm] = useState({ name: '', email: '', phone: '', city: '', state: '', gst_no: '', address: '' })
   const [stats, setStats] = useState<OrderStats | null>(null)
   const [orders, setOrders] = useState<OrderRow[]>([])
+  const [expandedIds, setExpandedIds] = useState<Set<number>>(new Set())
   const [filterMonth, setFilterMonth] = useState(String(new Date().getMonth() + 1))
   const [filterYear, setFilterYear] = useState(String(new Date().getFullYear()))
-  const [search, setSearch] = useState('')
+  const [search, setSearch] = useState(searchParams.get('search') || '')
   const [saved, setSaved] = useState(false)
   const [loading, setLoading] = useState(true)
 
@@ -63,7 +82,15 @@ export default function CompanyProfile() {
     apiFetch<CustomerCompany[]>('/api/customers')
       .then((data) => {
         setCompanies(data)
-        if (data.length > 0 && !selectedId) {
+        const idParam = searchParams.get('id')
+        const searchParam = searchParams.get('search')
+        if (idParam) {
+          setSelectedId(Number(idParam))
+        } else if (searchParam) {
+          const match = data.find((c) => c.name.toLowerCase().includes(searchParam.toLowerCase()))
+          setSelectedId(match?.id ?? data[0]?.id ?? null)
+          setSearch(searchParam)
+        } else if (data.length > 0 && !selectedId) {
           setSelectedId(data[0].id)
         }
       })
@@ -77,37 +104,39 @@ export default function CompanyProfile() {
     if (filterMonth) params.set('month', filterMonth)
     if (filterYear) params.set('year', filterYear)
 
-    apiFetch<{ orders: OrderRow[]; stats: OrderStats }>(`/api/customers/${selectedId}/orders?${params}`)
+    apiFetch<{ orders: OrderRow[]; stats: OrderStats; customer: CustomerCompany }>(
+      `/api/customers/${selectedId}/orders?${params}`
+    )
       .then((data) => {
         setOrders(data.orders)
         setStats(data.stats)
+        if (data.customer) {
+          setCompany(data.customer)
+          setEditName(data.customer.name)
+          setEditForm({
+            name: data.customer.name,
+            email: data.customer.email,
+            phone: data.customer.phone,
+            city: data.customer.city,
+            state: data.customer.state,
+            gst_no: data.customer.gst_no || '',
+            address: data.customer.address || '',
+          })
+        }
       })
       .catch(console.error)
 
-    apiFetch<CustomerCompany>(`/api/customers/${selectedId}`)
-      .then((c) => {
-        setCompany(c)
-        setEditName(c.name)
-        setEditForm({
-          name: c.name,
-          email: c.email,
-          phone: c.phone,
-          city: c.city,
-          state: c.state,
-          gst_no: c.gst_no || '',
-          address: c.address || '',
-        })
-      })
-      .catch(console.error)
+    setSearchParams((prev) => {
+      const next = new URLSearchParams(prev)
+      next.set('id', String(selectedId))
+      return next
+    }, { replace: true })
   }, [selectedId, filterMonth, filterYear, canAccess])
 
   const handleSave = async () => {
     if (!selectedId) return
     try {
-      const payload = isAdmin
-        ? editForm
-        : { name: editName }
-
+      const payload = isAdmin ? editForm : { name: editName }
       const updated = await apiFetch<CustomerCompany>(`/api/customers/${selectedId}`, {
         method: 'PUT',
         body: JSON.stringify(payload),
@@ -131,13 +160,19 @@ export default function CompanyProfile() {
     }
   }
 
-  const filtered = companies.filter((c) =>
-    !search ||
-    c.name.toLowerCase().includes(search.toLowerCase()) ||
-    (c.gst_no || '').toLowerCase().includes(search.toLowerCase())
+  const filtered = companies.filter(
+    (c) =>
+      !search ||
+      c.name.toLowerCase().includes(search.toLowerCase()) ||
+      (c.gst_no || '').toLowerCase().includes(search.toLowerCase())
   )
 
-  const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
+  const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+  const statusStyles: Record<string, string> = {
+    Pending: 'bg-amber-50 text-amber-700',
+    Completed: 'bg-emerald-50 text-emerald-700',
+    Cancelled: 'bg-rose-50 text-rose-700',
+  }
 
   if (!canAccess) {
     return (
@@ -145,7 +180,6 @@ export default function CompanyProfile() {
         <Building2 className="mx-auto h-10 w-10 text-slate-400" />
         <h1 className="mt-4 text-xl font-semibold text-slate-900">Company Profiles</h1>
         <p className="mt-2 text-sm text-slate-500">Buyer company profiles are available to admin and sales users.</p>
-        <p className="mt-1 text-sm text-slate-500">Add companies from the Customers page to track who you sell to.</p>
       </div>
     )
   }
@@ -155,12 +189,14 @@ export default function CompanyProfile() {
       <div>
         <h1 className="text-2xl font-semibold text-slate-900">Company Profiles</h1>
         <p className="mt-1 text-sm text-slate-500">
-          Buyer companies you sell to — address, GST, order frequency, and order history.
+          Company details, order summary, and full history.
           {isAdmin ? ' Admin can edit all fields.' : ' You can edit company name only.'}
         </p>
         <p className="mt-1 text-sm text-blue-600">
-          Add new companies from{' '}
+          Add companies from{' '}
           <Link to="/customers" className="font-medium underline hover:text-blue-700">Customers</Link>
+          {' · '}
+          <Link to="/orders" className="font-medium underline hover:text-blue-700">Sales Orders</Link>
         </p>
       </div>
 
@@ -180,20 +216,22 @@ export default function CompanyProfile() {
               <p className="p-3 text-sm text-slate-500">Loading...</p>
             ) : filtered.length === 0 ? (
               <p className="p-3 text-sm text-slate-500">No companies yet. Add them in Customers.</p>
-            ) : filtered.map((c) => (
-              <button
-                key={c.id}
-                onClick={() => setSelectedId(c.id)}
-                className={`w-full rounded-xl px-3 py-2.5 text-left transition ${
-                  selectedId === c.id ? 'bg-blue-600 text-white' : 'text-slate-700 hover:bg-slate-50'
-                }`}
-              >
-                <p className="truncate text-sm font-semibold">{c.name}</p>
-                <p className={`truncate text-xs ${selectedId === c.id ? 'text-blue-100' : 'text-slate-500'}`}>
-                  {c.gst_no || `${c.city}, ${c.state}`}
-                </p>
-              </button>
-            ))}
+            ) : (
+              filtered.map((c) => (
+                <button
+                  key={c.id}
+                  onClick={() => setSelectedId(c.id)}
+                  className={`w-full rounded-xl px-3 py-2.5 text-left transition ${
+                    selectedId === c.id ? 'bg-blue-600 text-white' : 'text-slate-700 hover:bg-slate-50'
+                  }`}
+                >
+                  <p className="truncate text-sm font-semibold">{c.name}</p>
+                  <p className={`truncate text-xs ${selectedId === c.id ? 'text-blue-100' : 'text-slate-500'}`}>
+                    {c.gst_no || `${c.city}, ${c.state}`}
+                  </p>
+                </button>
+              ))
+            )}
           </div>
         </div>
 
@@ -218,7 +256,7 @@ export default function CompanyProfile() {
                     </div>
                     <div>
                       <label className="mb-1 block text-sm font-medium text-slate-700">GST No.</label>
-                      <input value={editForm.gst_no} onChange={(e) => setEditForm({ ...editForm, gst_no: e.target.value })} placeholder="e.g. 27AABCU9603R1ZM" className="w-full rounded-xl border border-slate-300 px-3 py-2 outline-none focus:border-blue-500" />
+                      <input value={editForm.gst_no} onChange={(e) => setEditForm({ ...editForm, gst_no: e.target.value })} className="w-full rounded-xl border border-slate-300 px-3 py-2 outline-none focus:border-blue-500" />
                     </div>
                     <div className="md:col-span-2">
                       <label className="mb-1 block text-sm font-medium text-slate-700">Address</label>
@@ -264,8 +302,8 @@ export default function CompanyProfile() {
 
               {stats && (
                 <div className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
-                  <h2 className="mb-4 text-lg font-semibold text-slate-900">Order Frequency — {company.name}</h2>
-                  <div className="grid grid-cols-2 gap-4 md:grid-cols-4">
+                  <h2 className="mb-4 text-lg font-semibold text-slate-900">Summary — {company.name}</h2>
+                  <div className="grid grid-cols-2 gap-4 md:grid-cols-3 xl:grid-cols-6">
                     <div className="rounded-xl bg-blue-50 p-4 text-center">
                       <p className="text-2xl font-bold text-blue-600">{stats.totalOrders}</p>
                       <p className="text-xs text-slate-500">Total Orders</p>
@@ -282,6 +320,10 @@ export default function CompanyProfile() {
                       <p className="text-2xl font-bold text-violet-600">{stats.ordersThisMonth}</p>
                       <p className="text-xs text-slate-500">This Month</p>
                     </div>
+                    <div className="rounded-xl bg-slate-50 p-4 text-center md:col-span-2">
+                      <p className="text-xl font-bold text-slate-900">{ensureRupee(stats.totalRevenue || company.total_amount)}</p>
+                      <p className="text-xs text-slate-500">Lifetime revenue</p>
+                    </div>
                   </div>
                 </div>
               )}
@@ -294,42 +336,140 @@ export default function CompanyProfile() {
                   </div>
                   <div className="flex gap-2">
                     <select value={filterMonth} onChange={(e) => setFilterMonth(e.target.value)} className="rounded-xl border border-slate-300 px-3 py-2 text-sm outline-none focus:border-blue-500">
+                      <option value="">All months</option>
                       {months.map((m, i) => (
                         <option key={m} value={String(i + 1)}>{m}</option>
                       ))}
                     </select>
                     <select value={filterYear} onChange={(e) => setFilterYear(e.target.value)} className="rounded-xl border border-slate-300 px-3 py-2 text-sm outline-none focus:border-blue-500">
+                      <option value="">All years</option>
                       {[2024, 2025, 2026, 2027].map((y) => (
                         <option key={y} value={String(y)}>{y}</option>
                       ))}
                     </select>
                   </div>
                 </div>
+                {stats?.filteredRevenue ? (
+                  <p className="mb-3 text-sm text-slate-500">
+                    Period: <strong>{stats.filteredOrders ?? orders.length}</strong> orders ·{' '}
+                    <strong>{ensureRupee(stats.filteredRevenue)}</strong> revenue
+                  </p>
+                ) : null}
                 <div className="overflow-x-auto">
                   <table className="min-w-full text-left text-sm">
                     <thead className="border-b border-slate-200 text-slate-500">
                       <tr>
+                        <th className="py-2 pr-4 font-medium w-8" />
+                        <th className="py-2 pr-4 font-medium">Order Date</th>
+                        <th className="py-2 pr-4 font-medium">Closing Date</th>
                         <th className="py-2 pr-4 font-medium">Order No</th>
-                        <th className="py-2 pr-4 font-medium">Product</th>
-                        <th className="py-2 pr-4 font-medium">Date</th>
+                        <th className="py-2 pr-4 font-medium">Products</th>
                         <th className="py-2 pr-4 font-medium">Qty</th>
                         <th className="py-2 pr-4 font-medium">Amount</th>
+                        <th className="py-2 pr-4 font-medium">No of Days</th>
+                        <th className="py-2 pr-4 font-medium">MFG</th>
                         <th className="py-2 pr-4 font-medium">Status</th>
                       </tr>
                     </thead>
                     <tbody>
                       {orders.length === 0 ? (
-                        <tr><td colSpan={6} className="py-6 text-center text-slate-500">No orders for this company in selected period</td></tr>
-                      ) : orders.map((o) => (
-                        <tr key={o.id} className="border-b border-slate-100">
-                          <td className="py-2 pr-4 font-medium">{o.order_no}</td>
-                          <td className="py-2 pr-4 font-mono text-xs text-blue-600">{o.product_code || o.product_name || '—'}</td>
-                          <td className="py-2 pr-4">{o.date}</td>
-                          <td className="py-2 pr-4">{o.qty}</td>
-                          <td className="py-2 pr-4">{ensureRupee(o.amount)}</td>
-                          <td className="py-2 pr-4">{o.status}</td>
+                        <tr>
+                          <td colSpan={10} className="py-6 text-center text-slate-500">No orders for this company in selected period</td>
                         </tr>
-                      ))}
+                      ) : (
+                        orders.map((o) => {
+                          const isClosed = o.status === 'Completed' || o.status === 'Cancelled'
+                          const lines = o.items?.length
+                            ? o.items
+                            : [{ product_code: o.product_code || '—', qty: o.qty, unit_price: o.amount, amount: o.amount }]
+                          const expanded = expandedIds.has(o.id)
+                          const toggle = () => {
+                            setExpandedIds((prev) => {
+                              const next = new Set(prev)
+                              if (next.has(o.id)) next.delete(o.id)
+                              else next.add(o.id)
+                              return next
+                            })
+                          }
+                          return (
+                            <Fragment key={o.id}>
+                              <tr className="border-b border-slate-100">
+                                <td className="py-2 pr-2">
+                                  <button
+                                    type="button"
+                                    onClick={toggle}
+                                    className="inline-flex h-7 w-7 items-center justify-center rounded-lg border border-slate-200 text-slate-600 hover:bg-slate-100"
+                                    title={expanded ? 'Hide booking' : 'Show booking'}
+                                  >
+                                    {expanded ? <Minus className="h-3.5 w-3.5" /> : <Plus className="h-3.5 w-3.5" />}
+                                  </button>
+                                </td>
+                                <td className="py-2 pr-4 whitespace-nowrap">{o.date}</td>
+                                <td className="py-2 pr-4 whitespace-nowrap text-slate-600">
+                                  {isClosed ? o.closing_date || '—' : <span className="text-slate-400">Open</span>}
+                                </td>
+                                <td className="py-2 pr-4 font-medium">{o.order_no}</td>
+                                <td className="py-2 pr-4 text-slate-700">
+                                  {lines.length} product{lines.length === 1 ? '' : 's'}
+                                </td>
+                                <td className="py-2 pr-4">{o.qty}</td>
+                                <td className="py-2 pr-4">{ensureRupee(o.amount)}</td>
+                                <td className="py-2 pr-4">
+                                  <span className="font-semibold text-slate-900">{o.no_of_days ?? 0}</span>
+                                  <p className={`text-[11px] ${isClosed ? 'text-emerald-600' : 'text-slate-400'}`}>
+                                    {isClosed ? 'Closed' : 'Running'}
+                                  </p>
+                                </td>
+                                <td className="py-2 pr-4">{o.ok_to_mfg ? 'Yes' : 'No'}</td>
+                                <td className="py-2 pr-4">
+                                  <span className={`rounded-full px-2.5 py-1 text-xs font-semibold ${statusStyles[o.status] || 'bg-slate-100 text-slate-600'}`}>
+                                    {o.status}
+                                  </span>
+                                </td>
+                              </tr>
+                              {expanded && (
+                                <tr className="bg-slate-50/80">
+                                  <td colSpan={10} className="px-4 py-3">
+                                    <div className="overflow-hidden rounded-xl border border-slate-200 bg-white">
+                                      <p className="border-b border-slate-100 bg-slate-50 px-3 py-2 text-xs font-semibold uppercase tracking-wide text-slate-500">
+                                        Booking — {o.order_no}
+                                      </p>
+                                      <table className="w-full text-left text-sm">
+                                        <thead className="border-b border-slate-100 text-xs uppercase tracking-wide text-slate-500">
+                                          <tr>
+                                            <th className="px-3 py-2 font-semibold">Sr</th>
+                                            <th className="px-3 py-2 font-semibold">Product Code</th>
+                                            <th className="px-3 py-2 font-semibold">Qty</th>
+                                            <th className="px-3 py-2 font-semibold">Price</th>
+                                            <th className="px-3 py-2 font-semibold">Total</th>
+                                          </tr>
+                                        </thead>
+                                        <tbody>
+                                          {lines.map((item, lineIndex) => {
+                                            const qty = Number(item.qty) || 0
+                                            const amt = Number(String(item.amount || '').replace(/[^\d.-]/g, '')) || 0
+                                            const unitRaw = Number(String(item.unit_price || '').replace(/[^\d.-]/g, '')) || 0
+                                            const unit = unitRaw || (qty ? amt / qty : 0)
+                                            return (
+                                              <tr key={`${o.id}-${item.product_code}-${lineIndex}`} className="border-b border-slate-50 last:border-0">
+                                                <td className="px-3 py-2 font-semibold tabular-nums">{lineIndex + 1}</td>
+                                                <td className="px-3 py-2 font-mono font-semibold text-blue-700">{item.product_code}</td>
+                                                <td className="px-3 py-2 tabular-nums">{qty}</td>
+                                                <td className="px-3 py-2 tabular-nums">{formatRupee(unit)}</td>
+                                                <td className="px-3 py-2 font-medium tabular-nums">{formatRupee(amt || unit * qty)}</td>
+                                              </tr>
+                                            )
+                                          })}
+                                        </tbody>
+                                      </table>
+                                    </div>
+                                  </td>
+                                </tr>
+                              )}
+                            </Fragment>
+                          )
+                        })
+                      )}
                     </tbody>
                   </table>
                 </div>

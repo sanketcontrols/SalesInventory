@@ -1,6 +1,8 @@
 import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom'
 import Layout from './components/layout/Layout'
+import { AuthProvider, useAuth } from './context/AuthContext'
 import Customers from './pages/Customers'
+import CompanyProfile from './pages/CompanyProfile'
 import Dashboard from './pages/Dashboard'
 import Inventory from './pages/Inventory'
 import Login from './pages/Login'
@@ -8,9 +10,7 @@ import Orders from './pages/Orders'
 import Products from './pages/Products'
 import Reports from './pages/Reports'
 import Settings from './pages/Settings'
-import CompanyProfile from './pages/CompanyProfile'
 import AdminUsers from './pages/AdminUsers'
-import { getStoredUser } from './services/api'
 import { canAccessRoute, getHomePath, ROUTES } from './utils/roleAccess'
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
@@ -25,11 +25,18 @@ function RoleGate({
   path: string
   children: React.ReactNode
 }) {
-  const user = getStoredUser()
-  const role = user?.role
+  const { role, loading } = useAuth()
+
+  if (loading) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-slate-50 text-sm text-slate-500">
+        Loading your access...
+      </div>
+    )
+  }
 
   if (!role || role === 'pending') {
-    return path === ROUTES.settings ? <>{children}</> : <Navigate to={ROUTES.settings} replace />
+    return path === ROUTES.settings ? <Layout>{children}</Layout> : <Navigate to={ROUTES.settings} replace />
   }
 
   const home = getHomePath(role)
@@ -37,106 +44,96 @@ function RoleGate({
     return <Navigate to={home} replace />
   }
 
-  return <>{children}</>
+  return <Layout>{children}</Layout>
+}
+
+function AppRoutes() {
+  return (
+    <Routes>
+      <Route path="/login" element={<Login />} />
+      <Route path="/signup" element={<Navigate to="/login" replace />} />
+      <Route
+        path="/"
+        element={
+          <ProtectedRoute>
+            <RoleGate path={ROUTES.dashboard}><Dashboard /></RoleGate>
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/orders"
+        element={
+          <ProtectedRoute>
+            <RoleGate path={ROUTES.orders}><Orders /></RoleGate>
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/customers"
+        element={
+          <ProtectedRoute>
+            <RoleGate path={ROUTES.customers}><Customers /></RoleGate>
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/products"
+        element={
+          <ProtectedRoute>
+            <RoleGate path={ROUTES.products}><Products /></RoleGate>
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/inventory"
+        element={
+          <ProtectedRoute>
+            <RoleGate path={ROUTES.inventory}><Inventory /></RoleGate>
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/reports"
+        element={
+          <ProtectedRoute>
+            <RoleGate path={ROUTES.reports}><Reports /></RoleGate>
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/settings"
+        element={
+          <ProtectedRoute>
+            <RoleGate path={ROUTES.settings}><Settings /></RoleGate>
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/company-profile"
+        element={
+          <ProtectedRoute>
+            <RoleGate path={ROUTES.companyProfile}><CompanyProfile /></RoleGate>
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/admin/users"
+        element={
+          <ProtectedRoute>
+            <RoleGate path={ROUTES.adminUsers}><AdminUsers /></RoleGate>
+          </ProtectedRoute>
+        }
+      />
+    </Routes>
+  )
 }
 
 function App() {
   return (
     <BrowserRouter>
-      <Routes>
-        <Route path="/login" element={<Login />} />
-        <Route path="/signup" element={<Navigate to="/login" replace />} />
-        <Route
-          path="/"
-          element={
-            <ProtectedRoute>
-              <RoleGate path={ROUTES.dashboard}>
-                <Layout><Dashboard /></Layout>
-              </RoleGate>
-            </ProtectedRoute>
-          }
-        />
-        <Route
-          path="/orders"
-          element={
-            <ProtectedRoute>
-              <RoleGate path={ROUTES.orders}>
-                <Layout><Orders /></Layout>
-              </RoleGate>
-            </ProtectedRoute>
-          }
-        />
-        <Route
-          path="/customers"
-          element={
-            <ProtectedRoute>
-              <RoleGate path={ROUTES.customers}>
-                <Layout><Customers /></Layout>
-              </RoleGate>
-            </ProtectedRoute>
-          }
-        />
-        <Route
-          path="/products"
-          element={
-            <ProtectedRoute>
-              <RoleGate path={ROUTES.products}>
-                <Layout><Products /></Layout>
-              </RoleGate>
-            </ProtectedRoute>
-          }
-        />
-        <Route
-          path="/inventory"
-          element={
-            <ProtectedRoute>
-              <RoleGate path={ROUTES.inventory}>
-                <Layout><Inventory /></Layout>
-              </RoleGate>
-            </ProtectedRoute>
-          }
-        />
-        <Route
-          path="/reports"
-          element={
-            <ProtectedRoute>
-              <RoleGate path={ROUTES.reports}>
-                <Layout><Reports /></Layout>
-              </RoleGate>
-            </ProtectedRoute>
-          }
-        />
-        <Route
-          path="/settings"
-          element={
-            <ProtectedRoute>
-              <RoleGate path={ROUTES.settings}>
-                <Layout><Settings /></Layout>
-              </RoleGate>
-            </ProtectedRoute>
-          }
-        />
-        <Route
-          path="/company-profile"
-          element={
-            <ProtectedRoute>
-              <RoleGate path={ROUTES.companyProfile}>
-                <Layout><CompanyProfile /></Layout>
-              </RoleGate>
-            </ProtectedRoute>
-          }
-        />
-        <Route
-          path="/admin/users"
-          element={
-            <ProtectedRoute>
-              <RoleGate path={ROUTES.adminUsers}>
-                <Layout><AdminUsers /></Layout>
-              </RoleGate>
-            </ProtectedRoute>
-          }
-        />
-      </Routes>
+      <AuthProvider>
+        <AppRoutes />
+      </AuthProvider>
     </BrowserRouter>
   )
 }
