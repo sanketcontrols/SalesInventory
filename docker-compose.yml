@@ -3,8 +3,8 @@ services:
     image: postgres:16-alpine
     restart: unless-stopped
     ports:
-      # Open on office LAN so pgAdmin on PC can connect
-      - '5432:5432'
+      # Host 5433 — Synology often already uses 5432
+      - '${DB_HOST_PORT:-5433}:5432'
     environment:
       POSTGRES_USER: ${DB_USER:-postgres}
       POSTGRES_PASSWORD: ${DB_PASSWORD:-changeme}
@@ -21,7 +21,8 @@ services:
     build: .
     restart: unless-stopped
     ports:
-      - '${APP_PORT:-5000}:5000'
+      # Host 5080 — Synology DSM already uses 5000
+      - '${APP_PORT:-5080}:5000'
     environment:
       NODE_ENV: production
       PORT: 5000

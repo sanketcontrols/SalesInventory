@@ -83,6 +83,7 @@ In `docker/salesinventory` create file `.env`:
 ```env
 # IMPORTANT on Synology: DSM already uses port 5000 — do NOT use 5000
 APP_PORT=5080
+DB_HOST_PORT=5433
 DB_NAME=billing
 DB_USER=postgres
 DB_PASSWORD=ChooseAStrongPassword123
@@ -102,8 +103,9 @@ JWT_SECRET=ChooseALongRandomSecretKeyForJWT
 - `http://NAS_IP:5080`  
   Example: `http://192.168.1.50:5080`
 
-> Synology DSM already uses **port 5000**. If you map the app to 5000, Docker fails with  
-> `driver failed programming external connectivity`. Always use **5080** (or another free port).
+> Synology DSM already uses **port 5000**. Postgres on NAS often uses **5432**.  
+> Compose defaults: app **5080**, DB host port **5433**. If you still see  
+> `driver failed programming external connectivity`, pick other free ports in `.env`.
 
 First login (empty DB):
 - Email: `harsh@gmail.com`
