@@ -115,10 +115,24 @@ export async function initializeDatabase() {
     await pool.query(`ALTER TABLE customers ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP`)
     await pool.query(`ALTER TABLE customers ADD COLUMN IF NOT EXISTS gst_no VARCHAR(50) DEFAULT ''`)
     await pool.query(`ALTER TABLE customers ADD COLUMN IF NOT EXISTS address TEXT DEFAULT ''`)
+    await pool.query(`ALTER TABLE customers ALTER COLUMN phone TYPE VARCHAR(50)`)
+    await pool.query(`ALTER TABLE customers ALTER COLUMN email TYPE VARCHAR(255)`)
     await pool.query(`ALTER TABLE inventory ADD COLUMN IF NOT EXISTS created_by INTEGER`)
     await pool.query(`ALTER TABLE inventory ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP`)
     await pool.query(`ALTER TABLE inventory ADD COLUMN IF NOT EXISTS required_qty INTEGER DEFAULT 0`)
     await pool.query(`ALTER TABLE inventory ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP`)
+    await pool.query(`ALTER TABLE inventory ADD COLUMN IF NOT EXISTS rate NUMERIC(14, 2) NOT NULL DEFAULT 0`)
+    await pool.query(`ALTER TABLE inventory ADD COLUMN IF NOT EXISTS stock_target INTEGER`)
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS inventory_rate_history (
+        id SERIAL PRIMARY KEY,
+        inventory_id INTEGER NOT NULL REFERENCES inventory(id) ON DELETE CASCADE,
+        rate NUMERIC(14, 2) NOT NULL,
+        note TEXT DEFAULT '',
+        created_by INTEGER,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `)
     await pool.query(
       `ALTER TABLE company_settings ADD COLUMN IF NOT EXISTS low_stock_target INTEGER NOT NULL DEFAULT 20`
     )
@@ -206,11 +220,34 @@ export async function initializeDatabase() {
     await pool.query(`UPDATE inventory SET status = 'Stock Available' WHERE status = 'Normal'`)
     await pool.query(`UPDATE inventory SET status = 'Defect' WHERE status = 'Critical'`)
 
-    // Ensure primary admin account
-    await pool.query(`UPDATE users SET role = 'admin' WHERE email = 'harsh@gmail.com'`)
+    // Ensure primary admin always exists (NAS fresh volume / partial seed)
+    await pool.query(`UPDATE users SET role = 'admin' WHERE LOWER(email) = 'harsh@gmail.com'`)
+
+    const adminCheck = await pool.query(
+      `SELECT id FROM users WHERE LOWER(email) = 'harsh@gmail.com' LIMIT 1`
+    )
+    if (adminCheck.rows.length === 0) {
+      const hashedPassword = await hashPassword('123456')
+      await pool.query(
+        'INSERT INTO users (name, email, password, role) VALUES ($1, $2, $3, $4)',
+        ['Harsh', 'harsh@gmail.com', hashedPassword, 'admin']
+      )
+      console.log('Admin user created (harsh@gmail.com / 123456)')
+    }
+
+    // Optional: set RESET_ADMIN_PASSWORD=true in compose to restore 123456
+    if (String(process.env.RESET_ADMIN_PASSWORD || '').toLowerCase() === 'true') {
+      const hashedPassword = await hashPassword('123456')
+      await pool.query(
+        `UPDATE users SET password = $1, role = 'admin', name = COALESCE(NULLIF(name, ''), 'Harsh')
+         WHERE LOWER(email) = 'harsh@gmail.com'`,
+        [hashedPassword]
+      )
+      console.log('Admin password reset to 123456 (RESET_ADMIN_PASSWORD=true)')
+    }
 
     const unr = await pool.query(
-      `SELECT id FROM users WHERE (role IS NULL OR role = '') AND email <> 'harsh@gmail.com' ORDER BY id ASC`
+      `SELECT id FROM users WHERE (role IS NULL OR role = '') AND LOWER(email) <> 'harsh@gmail.com' ORDER BY id ASC`
     )
     if (unr.rows.length > 0) {
       await pool.query(`UPDATE users SET role = 'inventory' WHERE id = $1`, [unr.rows[0].id])
@@ -221,7 +258,9 @@ export async function initializeDatabase() {
 
     // For old demo data after adding created_by:
     // set created_by to admin so edits are allowed in the first 48 hours.
-    const adminIdRes = await pool.query(`SELECT id FROM users WHERE email = 'harsh@gmail.com' ORDER BY id LIMIT 1`)
+    const adminIdRes = await pool.query(
+      `SELECT id FROM users WHERE LOWER(email) = 'harsh@gmail.com' ORDER BY id LIMIT 1`
+    )
     const adminId = adminIdRes.rows[0]?.id
     if (adminId) {
       await pool.query(`UPDATE orders SET created_by = $1 WHERE created_by IS NULL`, [adminId])
@@ -238,9 +277,9 @@ export async function initializeDatabase() {
       )
       console.log('Admin user created (harsh@gmail.com / 123456)')
     } else {
-      const plainUsers = await pool.query("SELECT id, password FROM users WHERE password NOT LIKE '$2%'")
+      const plainUsers = await pool.query("SELECT id, password FROM users WHERE password IS NULL OR password NOT LIKE '$2%'")
       for (const user of plainUsers.rows) {
-        const hashedPassword = await hashPassword(user.password)
+        const hashedPassword = await hashPassword(user.password || '123456')
         await pool.query('UPDATE users SET password = $1 WHERE id = $2', [hashedPassword, user.id])
       }
       if (plainUsers.rows.length > 0) {

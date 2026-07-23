@@ -34,6 +34,8 @@ services:
       DB_PASSWORD: ${DB_PASSWORD:-changeme}
       JWT_SECRET: ${JWT_SECRET:-change-this-secret-in-production}
       DB_SSL: 'false'
+      # Set true once to restore harsh@gmail.com / 123456, then remove and rebuild
+      RESET_ADMIN_PASSWORD: ${RESET_ADMIN_PASSWORD:-true}
     depends_on:
       db:
         condition: service_healthy

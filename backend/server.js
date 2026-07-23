@@ -407,22 +407,37 @@ app.post('/api/login', async (req, res) => {
   }
 
   try {
-    const result = await pool.query('SELECT id, name, email, role, password FROM users WHERE LOWER(email) = LOWER($1)', [email])
+    let result = await pool.query(
+      'SELECT id, name, email, role, password FROM users WHERE LOWER(email) = LOWER($1)',
+      [email]
+    )
+
+    // Bootstrap admin on fresh NAS if account missing
+    if (result.rows.length === 0 && String(email).trim().toLowerCase() === 'harsh@gmail.com') {
+      const hashedPassword = await hashPassword('123456')
+      await pool.query(
+        'INSERT INTO users (name, email, password, role) VALUES ($1, $2, $3, $4) ON CONFLICT (email) DO NOTHING',
+        ['Harsh', 'harsh@gmail.com', hashedPassword, 'admin']
+      )
+      result = await pool.query(
+        'SELECT id, name, email, role, password FROM users WHERE LOWER(email) = LOWER($1)',
+        [email]
+      )
+    }
 
     if (result.rows.length === 0) {
       return res.status(401).json({ message: 'Invalid credentials.' })
     }
 
     const user = result.rows[0]
-
-    // Always use latest role from DB (admin may have changed it).
     const fresh = await pool.query('SELECT id, name, email, role FROM users WHERE id = $1', [user.id])
     const profile = fresh.rows[0] || user
 
     const valid = await verifyPassword(password, user.password)
-
     if (!valid) {
-      return res.status(401).json({ message: 'Invalid credentials.' })
+      return res.status(401).json({
+        message: 'Invalid credentials. Fresh NAS login: harsh@gmail.com / 123456',
+      })
     }
 
     if (!isHashed(user.password)) {
@@ -446,18 +461,17 @@ app.post('/api/login', async (req, res) => {
     const code = error?.code || ''
     if (code === 'ENOTFOUND' || code === 'ECONNREFUSED' || code === 'ETIMEDOUT' || code === '57P01') {
       return res.status(503).json({
-        message: 'Database unavailable. On NAS check that salesinventory-db-1 is running and .env DB_PASSWORD matches.',
+        message: 'Database unavailable. Check salesinventory-db-1 is running and DB_PASSWORD=changeme matches.',
       })
     }
     if (code === '28P01') {
       return res.status(503).json({
-        message:
-          'Database password rejected. On NAS, DB_PASSWORD in .env must match the password used when the Postgres volume was first created — or delete the postgres volume and recreate.',
+        message: 'Database password rejected. Use DB_PASSWORD=changeme (same as db container).',
       })
     }
     if (code === '3D000') {
       return res.status(503).json({
-        message: 'Database name not found. Check DB_NAME in .env (default: billing).',
+        message: 'Database name not found. Check DB_NAME=billing.',
       })
     }
     return res.status(500).json({
@@ -469,12 +483,20 @@ app.post('/api/login', async (req, res) => {
 app.get('/api/health', async (req, res) => {
   try {
     const info = await pool.query('SELECT current_database() AS db, NOW() AS now')
+    let users = 0
+    try {
+      const u = await pool.query('SELECT COUNT(*)::int AS count FROM users')
+      users = u.rows[0].count
+    } catch {
+      users = -1
+    }
     res.json({
       status: 'ok',
       database: 'connected',
       db: info.rows[0].db,
       host: process.env.DB_HOST || '(url)',
       ssl: process.env.DB_SSL || 'default',
+      users,
     })
   } catch (error) {
     res.status(503).json({
@@ -486,8 +508,12 @@ app.get('/api/health', async (req, res) => {
   }
 })
 
-// Protected routes
-app.use('/api', authMiddleware)
+// Protected routes (public paths already registered above)
+app.use('/api', (req, res, next) => {
+  const p = req.path || ''
+  if (p === '/login' || p === '/health' || p === '/signup') return next()
+  return authMiddleware(req, res, next)
+})
 
 app.get('/api/auth/me', async (req, res) => {
   try {

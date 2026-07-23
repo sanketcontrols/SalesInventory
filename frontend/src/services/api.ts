@@ -93,7 +93,12 @@ async function publicFetch<T>(url: string, options: RequestInit = {}): Promise<T
     ...options,
     headers: { 'Content-Type': 'application/json', ...(options.headers as Record<string, string>) },
   })
-  const data = await response.json()
+  let data: { message?: string } = {}
+  try {
+    data = await response.json()
+  } catch {
+    throw new Error(`Server returned ${response.status}. Open /api/health on the NAS to check the database.`)
+  }
   if (!response.ok) {
     throw new Error(data.message || 'Request failed')
   }

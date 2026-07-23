@@ -7,12 +7,14 @@ export async function hashPassword(password) {
 }
 
 export async function verifyPassword(plain, stored) {
-  if (stored.startsWith('$2')) {
-    return bcrypt.compare(plain, stored)
+  if (stored == null || stored === '') return false
+  const hash = String(stored)
+  if (hash.startsWith('$2')) {
+    return bcrypt.compare(plain, hash)
   }
-  return plain === stored
+  return plain === hash
 }
 
 export function isHashed(password) {
-  return password.startsWith('$2')
+  return Boolean(password) && String(password).startsWith('$2')
 }
