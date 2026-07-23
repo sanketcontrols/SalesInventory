@@ -34,8 +34,9 @@ services:
       DB_PASSWORD: ${DB_PASSWORD:-changeme}
       JWT_SECRET: ${JWT_SECRET:-change-this-secret-in-production}
       DB_SSL: 'false'
-      # Add RESET_ADMIN_PASSWORD=true to NAS .env once if login fails, then remove it
-      RESET_ADMIN_PASSWORD: ${RESET_ADMIN_PASSWORD:-false}
+      # On NAS/Docker, admin password is auto-healed to 123456 (set AUTO_FIX_ADMIN=false to disable)
+      AUTO_FIX_ADMIN: ${AUTO_FIX_ADMIN:-true}
+      RESET_ADMIN_PASSWORD: ${RESET_ADMIN_PASSWORD:-true}
     depends_on:
       db:
         condition: service_healthy

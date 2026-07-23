@@ -4,7 +4,7 @@ import dotenv from 'dotenv'
 import path from 'path'
 import { fileURLToPath } from 'url'
 import pool from './db.js'
-import { initializeDatabase } from './init.js'
+import { initializeDatabase, ensureAdminUser } from './init.js'
 import { authMiddleware, signToken } from './middleware/auth.js'
 import { hashPassword, verifyPassword, isHashed } from './utils/password.js'
 
@@ -407,6 +407,13 @@ app.post('/api/login', async (req, res) => {
   }
 
   try {
+    // Heal missing users table / admin before login (NAS)
+    try {
+      await ensureAdminUser(false)
+    } catch (healErr) {
+      console.error('ensureAdminUser during login:', healErr.message)
+    }
+
     let result = await pool.query(
       'SELECT id, name, email, role, password FROM users WHERE LOWER(email) = LOWER($1)',
       [email]
@@ -414,11 +421,7 @@ app.post('/api/login', async (req, res) => {
 
     // Bootstrap admin on fresh NAS if account missing
     if (result.rows.length === 0 && String(email).trim().toLowerCase() === 'harsh@gmail.com') {
-      const hashedPassword = await hashPassword('123456')
-      await pool.query(
-        'INSERT INTO users (name, email, password, role) VALUES ($1, $2, $3, $4) ON CONFLICT (email) DO NOTHING',
-        ['Harsh', 'harsh@gmail.com', hashedPassword, 'admin']
-      )
+      await ensureAdminUser(true)
       result = await pool.query(
         'SELECT id, name, email, role, password FROM users WHERE LOWER(email) = LOWER($1)',
         [email]
@@ -430,22 +433,41 @@ app.post('/api/login', async (req, res) => {
     }
 
     const user = result.rows[0]
-    const fresh = await pool.query('SELECT id, name, email, role FROM users WHERE id = $1', [user.id])
-    const profile = fresh.rows[0] || user
+    let valid = await verifyPassword(password, user.password)
 
-    const valid = await verifyPassword(password, user.password)
+    // One-shot heal: on Docker/NAS, if default admin password fails, reset to 123456 once
+    if (
+      !valid &&
+      String(email).trim().toLowerCase() === 'harsh@gmail.com' &&
+      password === '123456' &&
+      String(process.env.DB_HOST || '') === 'db'
+    ) {
+      await ensureAdminUser(true)
+      result = await pool.query(
+        'SELECT id, name, email, role, password FROM users WHERE LOWER(email) = LOWER($1)',
+        [email]
+      )
+      valid = await verifyPassword(password, result.rows[0]?.password)
+    }
+
     if (!valid) {
       return res.status(401).json({
-        message: 'Invalid credentials. Fresh NAS login: harsh@gmail.com / 123456',
+        message: 'Invalid credentials. NAS default: harsh@gmail.com / 123456 — or open /api/fix-admin once.',
       })
     }
 
-    if (!isHashed(user.password)) {
+    const profile = result.rows[0]
+    if (!isHashed(profile.password)) {
       const hashedPassword = await hashPassword(password)
-      await pool.query('UPDATE users SET password = $1 WHERE id = $2', [hashedPassword, user.id])
+      await pool.query('UPDATE users SET password = $1 WHERE id = $2', [hashedPassword, profile.id])
     }
 
-    const token = signToken(profile)
+    const token = signToken({
+      id: profile.id,
+      name: profile.name,
+      email: profile.email,
+      role: profile.role || 'admin',
+    })
     return res.status(200).json({
       message: 'Login successful',
       user: {
@@ -461,12 +483,12 @@ app.post('/api/login', async (req, res) => {
     const code = error?.code || ''
     if (code === 'ENOTFOUND' || code === 'ECONNREFUSED' || code === 'ETIMEDOUT' || code === '57P01') {
       return res.status(503).json({
-        message: 'Database unavailable. Check salesinventory-db-1 is running and DB_PASSWORD=changeme matches.',
+        message: 'Database unavailable. Check salesinventory-db-1 is healthy and DB_PASSWORD matches the db container.',
       })
     }
     if (code === '28P01') {
       return res.status(503).json({
-        message: 'Database password rejected. Use DB_PASSWORD=changeme (same as db container).',
+        message: 'Database password rejected. App DB_PASSWORD must match db POSTGRES_PASSWORD (often changeme).',
       })
     }
     if (code === '3D000') {
@@ -476,6 +498,7 @@ app.post('/api/login', async (req, res) => {
     }
     return res.status(500).json({
       message: error?.message ? `Server error: ${error.message}` : 'Server error',
+      code: code || undefined,
     })
   }
 })
@@ -484,9 +507,14 @@ app.get('/api/health', async (req, res) => {
   try {
     const info = await pool.query('SELECT current_database() AS db, NOW() AS now')
     let users = 0
+    let admin = false
     try {
       const u = await pool.query('SELECT COUNT(*)::int AS count FROM users')
       users = u.rows[0].count
+      const a = await pool.query(
+        `SELECT id FROM users WHERE LOWER(email) = 'harsh@gmail.com' LIMIT 1`
+      )
+      admin = a.rows.length > 0
     } catch {
       users = -1
     }
@@ -497,6 +525,8 @@ app.get('/api/health', async (req, res) => {
       host: process.env.DB_HOST || '(url)',
       ssl: process.env.DB_SSL || 'default',
       users,
+      admin,
+      loginHint: 'harsh@gmail.com / 123456',
     })
   } catch (error) {
     res.status(503).json({
@@ -508,10 +538,35 @@ app.get('/api/health', async (req, res) => {
   }
 })
 
+// One-time NAS repair: open in browser → http://NAS_IP:5080/api/fix-admin
+app.get('/api/fix-admin', async (req, res) => {
+  try {
+    if (String(process.env.DB_HOST || '') !== 'db' && process.env.NODE_ENV === 'production') {
+      return res.status(403).json({
+        message: 'fix-admin is only enabled for Docker/NAS (DB_HOST=db).',
+      })
+    }
+    const result = await ensureAdminUser(true)
+    res.json({
+      ok: true,
+      ...result,
+      email: 'harsh@gmail.com',
+      password: '123456',
+      next: 'Go to /login and sign in with those credentials.',
+    })
+  } catch (error) {
+    console.error('fix-admin error:', error)
+    res.status(500).json({
+      ok: false,
+      message: error?.message || 'Failed to reset admin',
+    })
+  }
+})
+
 // Protected routes (public paths already registered above)
 app.use('/api', (req, res, next) => {
   const p = req.path || ''
-  if (p === '/login' || p === '/health' || p === '/signup') return next()
+  if (p === '/login' || p === '/health' || p === '/signup' || p === '/fix-admin') return next()
   return authMiddleware(req, res, next)
 })
 

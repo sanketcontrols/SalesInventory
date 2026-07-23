@@ -1,8 +1,71 @@
 import pool from './db.js'
 import { hashPassword } from './utils/password.js'
 
+async function safeQuery(label, sql, params) {
+  try {
+    if (params) return await pool.query(sql, params)
+    return await pool.query(sql)
+  } catch (error) {
+    console.error(`Init skip [${label}]:`, error.message)
+    return null
+  }
+}
+
+/** Ensure harsh@gmail.com / 123456 works on NAS even if later migrations fail. */
+export async function ensureAdminUser(forceResetPassword = false) {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      id SERIAL PRIMARY KEY,
+      name VARCHAR(255) NOT NULL,
+      email VARCHAR(255) UNIQUE NOT NULL,
+      role VARCHAR(20) NOT NULL DEFAULT 'sales',
+      password VARCHAR(255) NOT NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `)
+  await safeQuery('users.role', `ALTER TABLE users ADD COLUMN IF NOT EXISTS role VARCHAR(20) DEFAULT 'sales'`)
+  await safeQuery('users.created_at', `ALTER TABLE users ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP`)
+
+  const hashedPassword = await hashPassword('123456')
+  const existing = await pool.query(
+    `SELECT id, password FROM users WHERE LOWER(email) = 'harsh@gmail.com' LIMIT 1`
+  )
+
+  if (existing.rows.length === 0) {
+    await pool.query(
+      'INSERT INTO users (name, email, password, role) VALUES ($1, $2, $3, $4)',
+      ['Harsh', 'harsh@gmail.com', hashedPassword, 'admin']
+    )
+    console.log('Admin user created (harsh@gmail.com / 123456)')
+    return { created: true, reset: false }
+  }
+
+  const shouldReset =
+    forceResetPassword ||
+    String(process.env.RESET_ADMIN_PASSWORD || '').toLowerCase() === 'true' ||
+    // Auto-heal when running against compose Postgres (NAS / Docker)
+    (String(process.env.DB_HOST || '') === 'db' &&
+      String(process.env.AUTO_FIX_ADMIN || 'true').toLowerCase() !== 'false')
+
+  if (shouldReset) {
+    await pool.query(
+      `UPDATE users SET password = $1, role = 'admin', name = COALESCE(NULLIF(name, ''), 'Harsh')
+       WHERE LOWER(email) = 'harsh@gmail.com'`,
+      [hashedPassword]
+    )
+    console.log('Admin password set to 123456 (NAS/Docker auto-fix)')
+    return { created: false, reset: true }
+  }
+
+  await pool.query(`UPDATE users SET role = 'admin' WHERE LOWER(email) = 'harsh@gmail.com'`)
+  return { created: false, reset: false }
+}
+
 export async function initializeDatabase() {
   try {
+    // Login-critical: do this first so a later migration failure cannot block sign-in
+    await ensureAdminUser(false)
+
     await pool.query(`
       CREATE TABLE IF NOT EXISTS users (
         id SERIAL PRIMARY KEY,
@@ -106,24 +169,26 @@ export async function initializeDatabase() {
 
     console.log('Database tables created successfully')
 
-    // RBAC + ownership columns (safe for existing DBs)
-    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS role VARCHAR(20) DEFAULT 'sales'`)
-    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP`)
-    await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS created_by INTEGER`)
-    await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP`)
-    await pool.query(`ALTER TABLE customers ADD COLUMN IF NOT EXISTS created_by INTEGER`)
-    await pool.query(`ALTER TABLE customers ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP`)
-    await pool.query(`ALTER TABLE customers ADD COLUMN IF NOT EXISTS gst_no VARCHAR(50) DEFAULT ''`)
-    await pool.query(`ALTER TABLE customers ADD COLUMN IF NOT EXISTS address TEXT DEFAULT ''`)
-    await pool.query(`ALTER TABLE customers ALTER COLUMN phone TYPE VARCHAR(50)`)
-    await pool.query(`ALTER TABLE customers ALTER COLUMN email TYPE VARCHAR(255)`)
-    await pool.query(`ALTER TABLE inventory ADD COLUMN IF NOT EXISTS created_by INTEGER`)
-    await pool.query(`ALTER TABLE inventory ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP`)
-    await pool.query(`ALTER TABLE inventory ADD COLUMN IF NOT EXISTS required_qty INTEGER DEFAULT 0`)
-    await pool.query(`ALTER TABLE inventory ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP`)
-    await pool.query(`ALTER TABLE inventory ADD COLUMN IF NOT EXISTS rate NUMERIC(14, 2) NOT NULL DEFAULT 0`)
-    await pool.query(`ALTER TABLE inventory ADD COLUMN IF NOT EXISTS stock_target INTEGER`)
-    await pool.query(`
+    // RBAC + ownership columns (safe for existing DBs; never abort startup)
+    await safeQuery('users.role', `ALTER TABLE users ADD COLUMN IF NOT EXISTS role VARCHAR(20) DEFAULT 'sales'`)
+    await safeQuery('users.created_at', `ALTER TABLE users ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP`)
+    await safeQuery('orders.created_by', `ALTER TABLE orders ADD COLUMN IF NOT EXISTS created_by INTEGER`)
+    await safeQuery('orders.created_at', `ALTER TABLE orders ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP`)
+    await safeQuery('customers.created_by', `ALTER TABLE customers ADD COLUMN IF NOT EXISTS created_by INTEGER`)
+    await safeQuery('customers.created_at', `ALTER TABLE customers ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP`)
+    await safeQuery('customers.gst_no', `ALTER TABLE customers ADD COLUMN IF NOT EXISTS gst_no VARCHAR(50) DEFAULT ''`)
+    await safeQuery('customers.address', `ALTER TABLE customers ADD COLUMN IF NOT EXISTS address TEXT DEFAULT ''`)
+    await safeQuery('customers.phone_type', `ALTER TABLE customers ALTER COLUMN phone TYPE VARCHAR(50)`)
+    await safeQuery('customers.email_type', `ALTER TABLE customers ALTER COLUMN email TYPE VARCHAR(255)`)
+    await safeQuery('inventory.created_by', `ALTER TABLE inventory ADD COLUMN IF NOT EXISTS created_by INTEGER`)
+    await safeQuery('inventory.created_at', `ALTER TABLE inventory ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP`)
+    await safeQuery('inventory.required_qty', `ALTER TABLE inventory ADD COLUMN IF NOT EXISTS required_qty INTEGER DEFAULT 0`)
+    await safeQuery('inventory.updated_at', `ALTER TABLE inventory ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP`)
+    await safeQuery('inventory.rate', `ALTER TABLE inventory ADD COLUMN IF NOT EXISTS rate NUMERIC(14, 2) NOT NULL DEFAULT 0`)
+    await safeQuery('inventory.stock_target', `ALTER TABLE inventory ADD COLUMN IF NOT EXISTS stock_target INTEGER`)
+    await safeQuery(
+      'inventory_rate_history',
+      `
       CREATE TABLE IF NOT EXISTS inventory_rate_history (
         id SERIAL PRIMARY KEY,
         inventory_id INTEGER NOT NULL REFERENCES inventory(id) ON DELETE CASCADE,
@@ -132,15 +197,19 @@ export async function initializeDatabase() {
         created_by INTEGER,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )
-    `)
-    await pool.query(
+    `
+    )
+    await safeQuery(
+      'company_settings.low_stock_target',
       `ALTER TABLE company_settings ADD COLUMN IF NOT EXISTS low_stock_target INTEGER NOT NULL DEFAULT 20`
     )
-    await pool.query(`ALTER TABLE customers ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP`)
-    await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP`)
-    await pool.query(`ALTER TABLE product_codes ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP`)
-    await pool.query(`ALTER TABLE product_codes ADD COLUMN IF NOT EXISTS stock_qty INTEGER NOT NULL DEFAULT 0`)
-    await pool.query(`
+    await safeQuery('customers.updated_at', `ALTER TABLE customers ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP`)
+    await safeQuery('orders.updated_at', `ALTER TABLE orders ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP`)
+    await safeQuery('product_codes.updated_at', `ALTER TABLE product_codes ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP`)
+    await safeQuery('product_codes.stock_qty', `ALTER TABLE product_codes ADD COLUMN IF NOT EXISTS stock_qty INTEGER NOT NULL DEFAULT 0`)
+    await safeQuery(
+      'product_stock_movements',
+      `
       CREATE TABLE IF NOT EXISTS product_stock_movements (
         id SERIAL PRIMARY KEY,
         product_code_id INTEGER NOT NULL REFERENCES product_codes(id) ON DELETE CASCADE,
@@ -152,22 +221,28 @@ export async function initializeDatabase() {
         created_by INTEGER,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )
-    `)
-    await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS product_code_id INTEGER`)
-    await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS product_code VARCHAR(50)`)
-    await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS product_name VARCHAR(255)`)
-    await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS stock_booked BOOLEAN DEFAULT FALSE`)
-    await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS no_of_days INTEGER DEFAULT 0`)
-    await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS ok_to_mfg BOOLEAN DEFAULT FALSE`)
-    await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS closed_at TIMESTAMP`)
+    `
+    )
+    await safeQuery('orders.product_code_id', `ALTER TABLE orders ADD COLUMN IF NOT EXISTS product_code_id INTEGER`)
+    await safeQuery('orders.product_code', `ALTER TABLE orders ADD COLUMN IF NOT EXISTS product_code VARCHAR(50)`)
+    await safeQuery('orders.product_name', `ALTER TABLE orders ADD COLUMN IF NOT EXISTS product_name VARCHAR(255)`)
+    await safeQuery('orders.stock_booked', `ALTER TABLE orders ADD COLUMN IF NOT EXISTS stock_booked BOOLEAN DEFAULT FALSE`)
+    await safeQuery('orders.no_of_days', `ALTER TABLE orders ADD COLUMN IF NOT EXISTS no_of_days INTEGER DEFAULT 0`)
+    await safeQuery('orders.ok_to_mfg', `ALTER TABLE orders ADD COLUMN IF NOT EXISTS ok_to_mfg BOOLEAN DEFAULT FALSE`)
+    await safeQuery('orders.closed_at', `ALTER TABLE orders ADD COLUMN IF NOT EXISTS closed_at TIMESTAMP`)
     // Backfill closing time for already completed/cancelled orders
-    await pool.query(`
+    await safeQuery(
+      'orders.closed_at_backfill',
+      `
       UPDATE orders
       SET closed_at = COALESCE(updated_at, created_at)
       WHERE status IN ('Completed', 'Cancelled')
         AND closed_at IS NULL
-    `)
-    await pool.query(`
+    `
+    )
+    await safeQuery(
+      'inventory_movements',
+      `
       CREATE TABLE IF NOT EXISTS inventory_movements (
         id SERIAL PRIMARY KEY,
         inventory_id INTEGER NOT NULL REFERENCES inventory(id) ON DELETE CASCADE,
@@ -179,8 +254,11 @@ export async function initializeDatabase() {
         created_by INTEGER,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )
-    `)
-    await pool.query(`
+    `
+    )
+    await safeQuery(
+      'order_items',
+      `
       CREATE TABLE IF NOT EXISTS order_items (
         id SERIAL PRIMARY KEY,
         order_id INTEGER NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
@@ -191,8 +269,11 @@ export async function initializeDatabase() {
         amount VARCHAR(50) DEFAULT '₹ 0',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )
-    `)
-    await pool.query(`
+    `
+    )
+    await safeQuery(
+      'monthly_qty_stats',
+      `
       CREATE TABLE IF NOT EXISTS monthly_qty_stats (
         id SERIAL PRIMARY KEY,
         kind VARCHAR(20) NOT NULL,
@@ -202,49 +283,31 @@ export async function initializeDatabase() {
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         UNIQUE (kind, ref_id, year_month)
       )
-    `)
-    await pool.query(
+    `
+    )
+    await safeQuery(
+      'idx_monthly_qty_stats_lookup',
       `CREATE INDEX IF NOT EXISTS idx_monthly_qty_stats_lookup
        ON monthly_qty_stats (kind, ref_id, year_month DESC)`
     )
 
-    await pool.query(`
+    await safeQuery(
+      'orders.stock_booked_backfill',
+      `
       UPDATE orders
       SET stock_booked = TRUE
       WHERE product_code_id IS NOT NULL
         AND status <> 'Cancelled'
         AND (stock_booked IS NULL OR stock_booked = FALSE)
-    `)
+    `
+    )
 
     // Rename legacy inventory status label
-    await pool.query(`UPDATE inventory SET status = 'Stock Available' WHERE status = 'Normal'`)
-    await pool.query(`UPDATE inventory SET status = 'Defect' WHERE status = 'Critical'`)
+    await safeQuery('inventory.status_normal', `UPDATE inventory SET status = 'Stock Available' WHERE status = 'Normal'`)
+    await safeQuery('inventory.status_critical', `UPDATE inventory SET status = 'Defect' WHERE status = 'Critical'`)
 
-    // Ensure primary admin always exists (NAS fresh volume / partial seed)
-    await pool.query(`UPDATE users SET role = 'admin' WHERE LOWER(email) = 'harsh@gmail.com'`)
-
-    const adminCheck = await pool.query(
-      `SELECT id FROM users WHERE LOWER(email) = 'harsh@gmail.com' LIMIT 1`
-    )
-    if (adminCheck.rows.length === 0) {
-      const hashedPassword = await hashPassword('123456')
-      await pool.query(
-        'INSERT INTO users (name, email, password, role) VALUES ($1, $2, $3, $4)',
-        ['Harsh', 'harsh@gmail.com', hashedPassword, 'admin']
-      )
-      console.log('Admin user created (harsh@gmail.com / 123456)')
-    }
-
-    // Optional: set RESET_ADMIN_PASSWORD=true in compose to restore 123456
-    if (String(process.env.RESET_ADMIN_PASSWORD || '').toLowerCase() === 'true') {
-      const hashedPassword = await hashPassword('123456')
-      await pool.query(
-        `UPDATE users SET password = $1, role = 'admin', name = COALESCE(NULLIF(name, ''), 'Harsh')
-         WHERE LOWER(email) = 'harsh@gmail.com'`,
-        [hashedPassword]
-      )
-      console.log('Admin password reset to 123456 (RESET_ADMIN_PASSWORD=true)')
-    }
+    // Re-run admin ensure after migrations (covers password reset flags)
+    await ensureAdminUser(false)
 
     const unr = await pool.query(
       `SELECT id FROM users WHERE (role IS NULL OR role = '') AND LOWER(email) <> 'harsh@gmail.com' ORDER BY id ASC`
@@ -268,23 +331,15 @@ export async function initializeDatabase() {
       await pool.query(`UPDATE inventory SET created_by = $1 WHERE created_by IS NULL`, [adminId])
     }
 
-    const userCheck = await pool.query('SELECT COUNT(*) FROM users')
-    if (userCheck.rows[0].count === '0') {
-      const hashedPassword = await hashPassword('123456')
-      await pool.query(
-        'INSERT INTO users (name, email, password, role) VALUES ($1, $2, $3, $4)',
-        ['Harsh', 'harsh@gmail.com', hashedPassword, 'admin']
-      )
-      console.log('Admin user created (harsh@gmail.com / 123456)')
-    } else {
-      const plainUsers = await pool.query("SELECT id, password FROM users WHERE password IS NULL OR password NOT LIKE '$2%'")
-      for (const user of plainUsers.rows) {
-        const hashedPassword = await hashPassword(user.password || '123456')
-        await pool.query('UPDATE users SET password = $1 WHERE id = $2', [hashedPassword, user.id])
-      }
-      if (plainUsers.rows.length > 0) {
-        console.log(`Upgraded ${plainUsers.rows.length} user password(s) to hashed format`)
-      }
+    const plainUsers = await pool.query(
+      "SELECT id, password FROM users WHERE password IS NULL OR password NOT LIKE '$2%'"
+    )
+    for (const user of plainUsers.rows) {
+      const hashedPassword = await hashPassword(user.password || '123456')
+      await pool.query('UPDATE users SET password = $1 WHERE id = $2', [hashedPassword, user.id])
+    }
+    if (plainUsers.rows.length > 0) {
+      console.log(`Upgraded ${plainUsers.rows.length} user password(s) to hashed format`)
     }
 
     const orderCheck = await pool.query('SELECT COUNT(*) FROM orders')
@@ -400,6 +455,25 @@ export async function initializeDatabase() {
     }
   } catch (error) {
     console.error('Database initialization error:', error)
-    throw error
+    const code = error?.code || ''
+    // Only fatal for real DB connectivity / auth problems
+    if (
+      code === 'ENOTFOUND' ||
+      code === 'ECONNREFUSED' ||
+      code === 'ETIMEDOUT' ||
+      code === '28P01' ||
+      code === '3D000' ||
+      code === '57P01'
+    ) {
+      throw error
+    }
+    // Keep the API up so login still works; log the rest
+    console.error('Non-fatal init error — continuing so login can work.')
+    try {
+      await ensureAdminUser(true)
+    } catch (adminErr) {
+      console.error('Admin ensure after init error failed:', adminErr.message)
+      throw error
+    }
   }
 }

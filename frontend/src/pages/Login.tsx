@@ -26,7 +26,12 @@ export default function Login() {
       await refreshUser()
       navigate(getHomePath(data.user.role))
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : 'Login failed')
+      const raw = error instanceof Error ? error.message : 'Login failed'
+      if (/server error|database|unavailable|rejected/i.test(raw)) {
+        setMessage(`${raw} Try http://YOUR-NAS:5080/api/fix-admin then login as harsh@gmail.com / 123456.`)
+      } else {
+        setMessage(raw)
+      }
     } finally {
       setLoading(false)
     }
