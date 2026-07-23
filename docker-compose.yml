@@ -1,6 +1,7 @@
 services:
   db:
     image: postgres:16-alpine
+    container_name: salesinventory-db
     restart: unless-stopped
     ports:
       # Host 5433 — Synology often already uses 5432
@@ -11,14 +12,18 @@ services:
       POSTGRES_DB: ${DB_NAME:-billing}
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    networks:
+      - billing
     healthcheck:
       test: ['CMD-SHELL', 'pg_isready -U ${DB_USER:-postgres} -d ${DB_NAME:-billing}']
       interval: 5s
       timeout: 5s
-      retries: 10
+      retries: 15
+      start_period: 10s
 
   app:
     build: .
+    container_name: salesinventory-app
     restart: unless-stopped
     ports:
       # Host 5080 — Synology DSM already uses 5000
@@ -26,20 +31,26 @@ services:
     environment:
       NODE_ENV: production
       PORT: 5000
-      # Always use the compose Postgres service on NAS (do not use Render URL here)
-      DB_HOST: db
+      # Fixed container name — more reliable on Synology than service alias "db"
+      DB_HOST: salesinventory-db
       DB_PORT: '5432'
       DB_NAME: ${DB_NAME:-billing}
       DB_USER: ${DB_USER:-postgres}
       DB_PASSWORD: ${DB_PASSWORD:-changeme}
       JWT_SECRET: ${JWT_SECRET:-change-this-secret-in-production}
       DB_SSL: 'false'
-      # On NAS/Docker, admin password is auto-healed to 123456 (set AUTO_FIX_ADMIN=false to disable)
       AUTO_FIX_ADMIN: ${AUTO_FIX_ADMIN:-true}
       RESET_ADMIN_PASSWORD: ${RESET_ADMIN_PASSWORD:-true}
     depends_on:
       db:
         condition: service_healthy
+    networks:
+      - billing
+
+networks:
+  billing:
+    name: salesinventory_net
 
 volumes:
   postgres_data:
+    name: salesinventory_postgres_data

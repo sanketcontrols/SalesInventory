@@ -24,7 +24,7 @@ function withSsl(config) {
 }
 
 function buildPoolConfig() {
-  // Prefer individual vars (Docker Compose / NAS sets DB_HOST=db)
+  // Prefer individual vars (Docker Compose / NAS)
   const host = process.env.DB_HOST || process.env.PGHOST
   const port = process.env.DB_PORT || process.env.PGPORT
   const database = process.env.DB_NAME || process.env.PGDATABASE
@@ -38,12 +38,16 @@ function buildPoolConfig() {
       user,
       password: password ?? '',
       database,
+      connectionTimeoutMillis: 8000,
     })
   }
 
   // Only use DATABASE_URL when DB_HOST is not set (Render / cloud)
   if (process.env.DATABASE_URL) {
-    return withSsl({ connectionString: process.env.DATABASE_URL })
+    return withSsl({
+      connectionString: process.env.DATABASE_URL,
+      connectionTimeoutMillis: 8000,
+    })
   }
 
   return {
@@ -52,6 +56,7 @@ function buildPoolConfig() {
     user: 'postgres',
     password: 'password',
     database: 'billing_system',
+    connectionTimeoutMillis: 8000,
   }
 }
 

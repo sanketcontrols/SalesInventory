@@ -44,7 +44,8 @@ export async function ensureAdminUser(forceResetPassword = false) {
     forceResetPassword ||
     String(process.env.RESET_ADMIN_PASSWORD || '').toLowerCase() === 'true' ||
     // Auto-heal when running against compose Postgres (NAS / Docker)
-    (String(process.env.DB_HOST || '') === 'db' &&
+    ((String(process.env.DB_HOST || '') === 'db' ||
+      String(process.env.DB_HOST || '').includes('salesinventory-db')) &&
       String(process.env.AUTO_FIX_ADMIN || 'true').toLowerCase() !== 'false')
 
   if (shouldReset) {

@@ -440,7 +440,8 @@ app.post('/api/login', async (req, res) => {
       !valid &&
       String(email).trim().toLowerCase() === 'harsh@gmail.com' &&
       password === '123456' &&
-      String(process.env.DB_HOST || '') === 'db'
+      (String(process.env.DB_HOST || '') === 'db' ||
+        String(process.env.DB_HOST || '').includes('salesinventory-db'))
     ) {
       await ensureAdminUser(true)
       result = await pool.query(
@@ -529,11 +530,25 @@ app.get('/api/health', async (req, res) => {
       loginHint: 'harsh@gmail.com / 123456',
     })
   } catch (error) {
+    const code = error?.code || ''
+    let hint =
+      'On NAS: 1) salesinventory-db must be Healthy 2) DB_PASSWORD must match on app+db 3) if you changed password after first run, delete volume salesinventory_postgres_data and recreate.'
+    if (code === 'ENOTFOUND' || code === 'EAI_AGAIN') {
+      hint =
+        'App cannot resolve DB host. Redeploy with docker compose so both containers share network salesinventory_net (DB_HOST=salesinventory-db).'
+    } else if (code === 'ECONNREFUSED') {
+      hint = 'Postgres is not accepting connections yet. Wait for salesinventory-db Healthy, then refresh.'
+    } else if (code === '28P01') {
+      hint =
+        'Wrong DB password. Set the SAME DB_PASSWORD on app and db. If volume was created with an old password, delete volume salesinventory_postgres_data and run compose up again.'
+    }
     res.status(503).json({
       status: 'error',
       database: 'disconnected',
       host: process.env.DB_HOST || '(url)',
+      code: code || undefined,
       message: error?.message || 'db error',
+      hint,
     })
   }
 })
@@ -541,9 +556,11 @@ app.get('/api/health', async (req, res) => {
 // One-time NAS repair: open in browser → http://NAS_IP:5080/api/fix-admin
 app.get('/api/fix-admin', async (req, res) => {
   try {
-    if (String(process.env.DB_HOST || '') !== 'db' && process.env.NODE_ENV === 'production') {
+    const host = String(process.env.DB_HOST || '')
+    const isDockerDb = host === 'db' || host.includes('salesinventory-db')
+    if (!isDockerDb && process.env.NODE_ENV === 'production') {
       return res.status(403).json({
-        message: 'fix-admin is only enabled for Docker/NAS (DB_HOST=db).',
+        message: 'fix-admin is only enabled for Docker/NAS.',
       })
     }
     const result = await ensureAdminUser(true)
