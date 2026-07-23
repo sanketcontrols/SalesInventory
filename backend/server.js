@@ -19,11 +19,16 @@ const PORT = process.env.PORT || 5000
 
 const corsOrigin = process.env.CORS_ORIGIN
 app.use(cors(corsOrigin ? { origin: corsOrigin.split(',').map((o) => o.trim()), credentials: true } : undefined))
-app.use(express.json())
+app.use(express.json({ limit: '20mb' }))
+app.use(express.urlencoded({ extended: true, limit: '20mb' }))
 
 await initializeDatabase().catch((error) => {
   console.error('Failed to initialize database:', error.message)
-  console.error('Make sure PostgreSQL is running and DATABASE_URL is correct.')
+  console.error('Check DB_HOST / DB_PASSWORD / Postgres container (NAS: service name is "db").')
+  if (process.env.NODE_ENV === 'production') {
+    // Crash so Docker restarts until Postgres is reachable with the right password
+    process.exit(1)
+  }
 })
 
 const EDIT_WINDOW_HOURS = 48
@@ -91,6 +96,14 @@ async function getLowStockTarget(client = pool) {
   }
 }
 
+function resolveItemTarget(row, globalTarget = lowStockTargetCache.value || 20) {
+  if (row && row.stock_target != null && row.stock_target !== '') {
+    const n = Number(row.stock_target)
+    if (Number.isFinite(n)) return Math.max(0, n)
+  }
+  return Math.max(0, Number(globalTarget) || 20)
+}
+
 function inventoryStatus(available, requiredQty = 0, lowStockTarget = lowStockTargetCache.value || 20) {
   const avail = Number(available) || 0
   const target = Math.max(0, Number(lowStockTarget) || 20)
@@ -107,10 +120,14 @@ function mapInventoryRow(row, lowStockTarget = lowStockTargetCache.value || 20) 
   // Booked / Required = qty reserved by Pending sales orders
   const booked = Number(row.sales_required ?? row.pending) || 0
   const used = Number(row.qty_used ?? row.used) || 0
+  const itemTarget = resolveItemTarget(row, lowStockTarget)
   return {
     ...row,
     qty: available,
     available,
+    rate: Number(row.rate) || 0,
+    stock_target: row.stock_target != null && row.stock_target !== '' ? Number(row.stock_target) : null,
+    effective_target: itemTarget,
     required_qty: booked,
     sales_required: booked,
     qty_used: used,
@@ -119,22 +136,57 @@ function mapInventoryRow(row, lowStockTarget = lowStockTargetCache.value || 20) 
     booked,
     pending: booked,
     remaining: available,
-    status: inventoryStatus(available, booked, lowStockTarget),
+    status: inventoryStatus(available, booked, itemTarget),
   }
 }
 
 async function refreshAllInventoryStatuses(client = pool) {
-  const target = await getLowStockTarget(client)
-  const rows = await client.query('SELECT id, available FROM inventory')
+  const globalTarget = await getLowStockTarget(client)
+  const rows = await client.query('SELECT id, available, stock_target FROM inventory')
   for (const row of rows.rows) {
     const booked = await getBookedQtyForInventory(row.id, client)
+    const target = resolveItemTarget(row, globalTarget)
     const status = inventoryStatus(Number(row.available), booked, target)
     await client.query(
       `UPDATE inventory SET pending = $1, status = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $3`,
       [booked, status, row.id]
     )
   }
-  return target
+  return globalTarget
+}
+
+/** Keep last 5 rates per inventory item (queue). */
+async function recordInventoryRate(inventoryId, rate, userId, note = '', client = pool) {
+  const value = Number(rate)
+  if (!Number.isFinite(value)) return
+  await client.query(
+    `INSERT INTO inventory_rate_history (inventory_id, rate, note, created_by)
+     VALUES ($1, $2, $3, $4)`,
+    [inventoryId, value, note || '', userId || null]
+  )
+  await client.query(
+    `DELETE FROM inventory_rate_history
+     WHERE inventory_id = $1
+       AND id NOT IN (
+         SELECT id FROM inventory_rate_history
+         WHERE inventory_id = $1
+         ORDER BY created_at DESC, id DESC
+         LIMIT 5
+       )`,
+    [inventoryId]
+  )
+}
+
+async function getInventoryRateHistory(inventoryId, client = pool) {
+  const result = await client.query(
+    `SELECT id, rate::float AS rate, note, created_by, created_at
+     FROM inventory_rate_history
+     WHERE inventory_id = $1
+     ORDER BY created_at DESC, id DESC
+     LIMIT 5`,
+    [inventoryId]
+  )
+  return result.rows
 }
 
 async function getBookedQtyForInventory(inventoryId, client = pool) {
@@ -391,16 +443,46 @@ app.post('/api/login', async (req, res) => {
     })
   } catch (error) {
     console.error('Login error:', error)
-    return res.status(500).json({ message: 'Server error' })
+    const code = error?.code || ''
+    if (code === 'ENOTFOUND' || code === 'ECONNREFUSED' || code === 'ETIMEDOUT' || code === '57P01') {
+      return res.status(503).json({
+        message: 'Database unavailable. On NAS check that salesinventory-db-1 is running and .env DB_PASSWORD matches.',
+      })
+    }
+    if (code === '28P01') {
+      return res.status(503).json({
+        message:
+          'Database password rejected. On NAS, DB_PASSWORD in .env must match the password used when the Postgres volume was first created — or delete the postgres volume and recreate.',
+      })
+    }
+    if (code === '3D000') {
+      return res.status(503).json({
+        message: 'Database name not found. Check DB_NAME in .env (default: billing).',
+      })
+    }
+    return res.status(500).json({
+      message: error?.message ? `Server error: ${error.message}` : 'Server error',
+    })
   }
 })
 
 app.get('/api/health', async (req, res) => {
   try {
-    await pool.query('SELECT 1')
-    res.json({ status: 'ok', database: 'connected' })
-  } catch {
-    res.status(503).json({ status: 'error', database: 'disconnected' })
+    const info = await pool.query('SELECT current_database() AS db, NOW() AS now')
+    res.json({
+      status: 'ok',
+      database: 'connected',
+      db: info.rows[0].db,
+      host: process.env.DB_HOST || '(url)',
+      ssl: process.env.DB_SSL || 'default',
+    })
+  } catch (error) {
+    res.status(503).json({
+      status: 'error',
+      database: 'disconnected',
+      host: process.env.DB_HOST || '(url)',
+      message: error?.message || 'db error',
+    })
   }
 })
 
@@ -771,43 +853,81 @@ app.get('/api/notifications', authMiddleware, async (req, res) => {
 
     if (showStock) {
       const lowStock = await pool.query(
-        "SELECT name, sku, available, status FROM inventory WHERE status IN ('Low Stock', 'Defect', 'Critical') ORDER BY available ASC LIMIT 10"
+        `SELECT id, name, sku, available, status, COALESCE(stock_target, 0)::int AS stock_target
+         FROM inventory
+         WHERE status IN ('Low Stock', 'Defect', 'Critical')
+         ORDER BY available ASC
+         LIMIT 50`
       )
-      const outOfStock = lowStock.rows.filter((r) => r.available === 0)
+      const outOfStock = lowStock.rows.filter((r) => Number(r.available) <= 0)
+      const lowOnly = lowStock.rows.filter((r) => Number(r.available) > 0)
 
       if (outOfStock.length > 0) {
         items.push({
+          id: 'out-of-stock',
           title: `${outOfStock.length} Out of Stock`,
-          description: outOfStock.map((r) => r.name).join(', '),
+          description: outOfStock
+            .slice(0, 4)
+            .map((r) => r.name)
+            .join(', '),
           tone: 'red',
+          href: '/alerts/low-stock',
+          kind: 'low-stock',
         })
       }
 
-      const lowOnly = lowStock.rows.filter((r) => r.available > 0)
       if (lowOnly.length > 0) {
         items.push({
+          id: 'low-stock',
           title: `${lowOnly.length} Low Stock Alert${lowOnly.length > 1 ? 's' : ''}`,
-          description: 'Review inventory and reorder items below threshold.',
+          description: 'Qty below target — open to review inventory.',
           tone: 'amber',
+          href: '/alerts/low-stock',
+          kind: 'low-stock',
         })
       }
 
-      if (items.length === 0) {
+      if (outOfStock.length === 0 && lowOnly.length === 0) {
         items.push({
+          id: 'stock-ok',
           title: 'Stock Levels Normal',
-          description: 'All inventory items are within normal levels.',
+          description: 'All inventory items are within target levels.',
           tone: 'green',
         })
       }
     }
 
     if (showOrders) {
-      const pendingOrders = await pool.query("SELECT COUNT(*)::int AS count FROM orders WHERE status = 'Pending'")
-      if (pendingOrders.rows[0].count > 0) {
+      const overdue = await pool.query(
+        `SELECT COUNT(*)::int AS count
+         FROM orders
+         WHERE status = 'Pending'
+           AND COALESCE(created_at, updated_at, CURRENT_TIMESTAMP) < (CURRENT_TIMESTAMP - INTERVAL '10 days')`
+      )
+      const overdueCount = Number(overdue.rows[0]?.count) || 0
+      if (overdueCount > 0) {
         items.push({
-          title: `${pendingOrders.rows[0].count} Pending Order${pendingOrders.rows[0].count > 1 ? 's' : ''}`,
+          id: 'pending-overdue',
+          title: `${overdueCount} Order${overdueCount > 1 ? 's' : ''} Pending > 10 Days`,
+          description: 'Click to open overdue pending orders.',
+          tone: 'amber',
+          href: '/alerts/pending-orders',
+          kind: 'pending-orders',
+        })
+      }
+
+      const pendingOrders = await pool.query(
+        `SELECT COUNT(*)::int AS count FROM orders WHERE status = 'Pending'`
+      )
+      const pendingCount = Number(pendingOrders.rows[0]?.count) || 0
+      if (pendingCount > 0 && overdueCount === 0) {
+        items.push({
+          id: 'pending-orders',
+          title: `${pendingCount} Pending Order${pendingCount > 1 ? 's' : ''}`,
           description: 'Orders awaiting completion or dispatch.',
           tone: 'blue',
+          href: '/alerts/pending-orders',
+          kind: 'pending-orders',
         })
       }
     }
@@ -815,6 +935,72 @@ app.get('/api/notifications', authMiddleware, async (req, res) => {
     res.json(items)
   } catch (error) {
     console.error('Notifications error:', error)
+    res.status(500).json({ message: 'Server error' })
+  }
+})
+
+/** Overdue / pending orders for alerts page */
+app.get('/api/alerts/pending-orders', requireRoles(['admin', 'sales']), async (req, res) => {
+  try {
+    const onlyOverdue = String(req.query.overdue || '1') !== '0'
+    const result = await pool.query(
+      `SELECT
+         o.id,
+         o.order_no,
+         o.company,
+         o.product_code,
+         o.product_name,
+         o.qty,
+         o.amount,
+         o.status,
+         o.date,
+         o.created_at,
+         GREATEST(
+           0,
+           FLOOR(EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - COALESCE(o.created_at, o.updated_at))) / 86400)
+         )::int AS days_pending
+       FROM orders o
+       WHERE o.status = 'Pending'
+         ${
+           onlyOverdue
+             ? `AND COALESCE(o.created_at, o.updated_at, CURRENT_TIMESTAMP) < (CURRENT_TIMESTAMP - INTERVAL '10 days')`
+             : ''
+         }
+       ORDER BY COALESCE(o.created_at, o.updated_at) ASC`
+    )
+    res.json({
+      threshold_days: 10,
+      rows: result.rows,
+    })
+  } catch (error) {
+    console.error('Pending alerts error:', error)
+    res.status(500).json({ message: 'Server error' })
+  }
+})
+
+/** Low stock inventory for alerts page */
+app.get('/api/alerts/low-stock', requireRoles(['admin', 'inventory']), async (req, res) => {
+  try {
+    const globalTarget = await getLowStockTarget()
+    const result = await pool.query(
+      `SELECT i.*,
+        COALESCE((
+          SELECT SUM(pci.qty_per_unit * oi.qty)::int
+          FROM product_code_items pci
+          JOIN order_items oi ON oi.product_code_id = pci.product_code_id
+          JOIN orders o ON o.id = oi.order_id
+          WHERE pci.inventory_id = i.id AND o.status = 'Pending'
+        ), 0)::int AS sales_required
+       FROM inventory i
+       WHERE i.status IN ('Low Stock', 'Defect', 'Critical')
+       ORDER BY i.available ASC, i.name ASC`
+    )
+    res.json({
+      global_target: globalTarget,
+      rows: result.rows.map((row) => mapInventoryRow(row, globalTarget)),
+    })
+  } catch (error) {
+    console.error('Low stock alerts error:', error)
     res.status(500).json({ message: 'Server error' })
   }
 })
@@ -1919,15 +2105,17 @@ app.get('/api/customers/:id/orders', requireRoles(['admin', 'sales']), async (re
 app.post('/api/customers', requireRoles(['admin', 'sales']), async (req, res) => {
   const { name, email, phone, city, state, gst_no, address } = req.body
 
-  if (!name || !email || !phone || !city || !state) {
-    return res.status(400).json({ message: 'Name, email, phone, city, and state are required.' })
+  if (!name || !city || !state) {
+    return res.status(400).json({ message: 'Company name, city, and state are required.' })
   }
 
   try {
+    const emailVal = String(email || '').trim() || '-'
+    const phoneVal = String(phone || '').trim() || '-'
     const result = await pool.query(
       `INSERT INTO customers (name, email, phone, city, state, orders_count, total_amount, gst_no, address, created_by)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *`,
-      [name, email, phone, city, state, 0, '₹ 0', gst_no || '', address || '', req.user.id]
+      [name, emailVal, phoneVal, city, state, 0, '₹ 0', gst_no || '', address || '', req.user.id]
     )
 
     res.status(201).json(result.rows[0])
@@ -2111,7 +2299,7 @@ app.get('/api/inventory', requireRoles(['admin', 'inventory', 'sales']), async (
 })
 
 app.post('/api/inventory', requireRoles(['admin', 'inventory']), async (req, res) => {
-  const { name, available, pending, reserved, status } = req.body
+  const { name, available, pending, reserved, status, rate, stock_target } = req.body
 
   if (!name || !String(name).trim()) {
     return res.status(400).json({ message: 'Inventory name is required.' })
@@ -2121,8 +2309,12 @@ app.post('/api/inventory', requireRoles(['admin', 'inventory']), async (req, res
     const avail = Number(available) || 0
     const pend = Number(pending) || 0
     const resv = Number(reserved) || 0
-    const target = await getLowStockTarget()
-    const itemStatus = status || inventoryStatus(avail, 0, target)
+    const rateVal = Number(rate) || 0
+    const itemTarget =
+      stock_target === '' || stock_target == null ? null : Math.max(0, Number(stock_target) || 0)
+    const globalTarget = await getLowStockTarget()
+    const effective = itemTarget != null ? itemTarget : globalTarget
+    const itemStatus = status || inventoryStatus(avail, 0, effective)
     const base = String(name)
       .toUpperCase()
       .replace(/[^A-Z0-9]+/g, '-')
@@ -2131,12 +2323,16 @@ app.post('/api/inventory', requireRoles(['admin', 'inventory']), async (req, res
     const sku = `${base || 'ITEM'}-${Date.now().toString().slice(-4)}`
 
     const result = await pool.query(
-      `INSERT INTO inventory (name, sku, available, pending, reserved, required_qty, status, created_by, updated_at)
-       VALUES ($1, $2, $3, $4, $5, 0, $6, $7, CURRENT_TIMESTAMP) RETURNING *`,
-      [name.trim(), sku, avail, pend, resv, itemStatus, req.user.id]
+      `INSERT INTO inventory (name, sku, available, pending, reserved, required_qty, status, rate, stock_target, created_by, updated_at)
+       VALUES ($1, $2, $3, $4, $5, 0, $6, $7, $8, $9, CURRENT_TIMESTAMP) RETURNING *`,
+      [name.trim(), sku, avail, pend, resv, itemStatus, rateVal, itemTarget, req.user.id]
     )
 
-    res.status(201).json(mapInventoryRow({ ...result.rows[0], sales_required: 0, monthly_avg: 0 }, target))
+    if (rateVal > 0) {
+      await recordInventoryRate(result.rows[0].id, rateVal, req.user.id, 'Initial rate')
+    }
+
+    res.status(201).json(mapInventoryRow({ ...result.rows[0], sales_required: 0, monthly_avg: 0 }, globalTarget))
   } catch (error) {
     console.error('Error creating inventory:', error)
     res.status(500).json({ message: 'Server error' })
@@ -2145,7 +2341,7 @@ app.post('/api/inventory', requireRoles(['admin', 'inventory']), async (req, res
 
 app.put('/api/inventory/:id', requireRoles(['admin', 'inventory']), async (req, res) => {
   const { id } = req.params
-  const { available, reserved, status, name } = req.body
+  const { available, reserved, status, name, rate, stock_target } = req.body
 
   try {
     const existing = await pool.query('SELECT * FROM inventory WHERE id = $1', [id])
@@ -2159,8 +2355,20 @@ app.put('/api/inventory/:id', requireRoles(['admin', 'inventory']), async (req, 
 
     const avail = available != null ? Number(available) : existing.rows[0].available
     const booked = await getBookedQtyForInventory(id)
-    const target = await getLowStockTarget()
-    const autoStatus = status || inventoryStatus(avail, booked, target)
+    const globalTarget = await getLowStockTarget()
+
+    let nextTarget = existing.rows[0].stock_target
+    if (stock_target !== undefined) {
+      nextTarget =
+        stock_target === '' || stock_target == null ? null : Math.max(0, Number(stock_target) || 0)
+    }
+
+    const rateProvided = rate !== undefined && rate !== null && rate !== ''
+    const nextRate = rateProvided ? Number(rate) || 0 : Number(existing.rows[0].rate) || 0
+    const prevRate = Number(existing.rows[0].rate) || 0
+
+    const effective = resolveItemTarget({ stock_target: nextTarget }, globalTarget)
+    const autoStatus = status || inventoryStatus(avail, booked, effective)
 
     const result = await pool.query(
       `UPDATE inventory SET
@@ -2169,19 +2377,27 @@ app.put('/api/inventory/:id', requireRoles(['admin', 'inventory']), async (req, 
         pending = $3,
         reserved = COALESCE($4, reserved),
         status = $5,
+        rate = $6,
+        stock_target = $7,
         updated_at = CURRENT_TIMESTAMP
-       WHERE id = $6 RETURNING *`,
+       WHERE id = $8 RETURNING *`,
       [
         name != null ? String(name).trim() : null,
         available != null ? Number(available) : null,
         booked,
         reserved != null ? Number(reserved) : null,
         autoStatus,
+        nextRate,
+        nextTarget,
         id,
       ]
     )
 
-    res.json(mapInventoryRow({ ...result.rows[0], sales_required: booked }, target))
+    if (rateProvided && nextRate !== prevRate) {
+      await recordInventoryRate(id, nextRate, req.user.id, 'Rate updated')
+    }
+
+    res.json(mapInventoryRow({ ...result.rows[0], sales_required: booked }, globalTarget))
   } catch (error) {
     console.error('Error updating inventory:', error)
     res.status(500).json({ message: 'Server error' })
@@ -2204,7 +2420,8 @@ app.post('/api/inventory/:id/adjust', requireRoles(['admin', 'inventory']), asyn
 
     const avail = Number(existing.rows[0].available) + delta
     const booked = await getBookedQtyForInventory(id)
-    const target = await getLowStockTarget()
+    const globalTarget = await getLowStockTarget()
+    const target = resolveItemTarget(existing.rows[0], globalTarget)
     const autoStatus = inventoryStatus(avail, booked, target)
 
     const result = await pool.query(
@@ -2217,7 +2434,7 @@ app.post('/api/inventory/:id/adjust', requireRoles(['admin', 'inventory']), asyn
       [avail, booked, autoStatus, id]
     )
 
-    res.json(mapInventoryRow({ ...result.rows[0], sales_required: booked }, target))
+    res.json(mapInventoryRow({ ...result.rows[0], sales_required: booked }, globalTarget))
   } catch (error) {
     console.error('Error adjusting inventory:', error)
     res.status(500).json({ message: 'Server error' })
@@ -2316,12 +2533,35 @@ app.get('/api/inventory/:id/monthly-stats', requireRoles(['admin', 'inventory', 
   }
 })
 
+/** Last 5 rates (queue) for an inventory item */
+app.get('/api/inventory/:id/rates', requireRoles(['admin', 'inventory', 'sales']), async (req, res) => {
+  const { id } = req.params
+  try {
+    const inv = await pool.query('SELECT id, name, rate FROM inventory WHERE id = $1', [id])
+    if (inv.rows.length === 0) {
+      return res.status(404).json({ message: 'Item not found' })
+    }
+    const rates = await getInventoryRateHistory(id)
+    res.json({
+      inventory: {
+        id: inv.rows[0].id,
+        name: inv.rows[0].name,
+        rate: Number(inv.rows[0].rate) || 0,
+      },
+      rates,
+    })
+  } catch (error) {
+    console.error('Error fetching inventory rates:', error)
+    res.status(500).json({ message: 'Server error' })
+  }
+})
+
 /** Full inventory summary: stats, per-company, monthly, history */
 app.get('/api/inventory/:id/summary', requireRoles(['admin', 'inventory', 'sales']), async (req, res) => {
   const { id } = req.params
   try {
     const invRes = await pool.query(
-      `SELECT id, name, sku, available, pending, reserved, status
+      `SELECT id, name, sku, available, pending, reserved, status, rate, stock_target
        FROM inventory WHERE id = $1`,
       [id]
     )
@@ -2333,7 +2573,9 @@ app.get('/api/inventory/:id/summary', requireRoles(['admin', 'inventory', 'sales
     await syncInventoryMonthlyStats(inventoryId)
     const months = await getStoredMonthlyStats('inventory', inventoryId)
     const booked = await getBookedQtyForInventory(inventoryId)
-    const target = await getLowStockTarget()
+    const globalTarget = await getLowStockTarget()
+    const target = resolveItemTarget(invRes.rows[0], globalTarget)
+    const rateHistory = await getInventoryRateHistory(inventoryId)
 
     const now = new Date()
     const fy = getFinancialYear(now)
@@ -2485,6 +2727,9 @@ app.get('/api/inventory/:id/summary', requireRoles(['admin', 'inventory', 'sales
       inventory: {
         ...row,
         available: Number(row.available) || 0,
+        rate: Number(row.rate) || 0,
+        stock_target: row.stock_target != null ? Number(row.stock_target) : null,
+        effective_target: target,
         required_qty: booked,
         status: inventoryStatus(Number(row.available) || 0, booked, target),
       },
@@ -2502,6 +2747,9 @@ app.get('/api/inventory/:id/summary', requireRoles(['admin', 'inventory', 'sales
         lifetime_qty: usedQty,
         inward_qty: inwardQty,
         months_active: monthsActive,
+        rate: Number(row.rate) || 0,
+        stock_target: row.stock_target != null ? Number(row.stock_target) : null,
+        effective_target: target,
       },
       companies,
       products: linkedProducts.rows.map((p) => ({
@@ -2511,6 +2759,7 @@ app.get('/api/inventory/:id/summary', requireRoles(['admin', 'inventory', 'sales
         qty_per_unit: Number(p.qty_per_unit) || 1,
       })),
       months,
+      rates: rateHistory,
       history,
     })
   } catch (error) {
@@ -2545,7 +2794,8 @@ app.post('/api/inventory/:id/add-qty', requireRoles(['admin', 'inventory']), asy
 
     const avail = Number(existing.rows[0].available) + qty
     const booked = await getBookedQtyForInventory(id, client)
-    const target = await getLowStockTarget(client)
+    const globalTarget = await getLowStockTarget(client)
+    const target = resolveItemTarget(existing.rows[0], globalTarget)
     const autoStatus = inventoryStatus(avail, booked, target)
 
     const result = await client.query(
@@ -2565,7 +2815,7 @@ app.post('/api/inventory/:id/add-qty', requireRoles(['admin', 'inventory']), asy
     )
 
     await client.query('COMMIT')
-    res.json(mapInventoryRow({ ...result.rows[0], sales_required: booked }, target))
+    res.json(mapInventoryRow({ ...result.rows[0], sales_required: booked }, globalTarget))
   } catch (error) {
     await client.query('ROLLBACK')
     console.error('Error adding inventory qty:', error)
@@ -2677,30 +2927,76 @@ app.post('/api/customers/import', requireRoles(['admin', 'sales']), async (req, 
   const { rows } = req.body
   if (!rows?.length) return res.status(400).json({ message: 'No rows to import.' })
 
+  const dash = (v) => {
+    const s = String(v ?? '').trim()
+    return s || '-'
+  }
+  const clip = (v, n) => {
+    const s = dash(v)
+    return s.length > n ? s.slice(0, n) : s
+  }
+  const normalizePhone = (raw) => {
+    const s = String(raw ?? '').trim()
+    if (!s) return '-'
+    const match = s.replace(/\s+/g, ' ').match(/[\d+][\d\s\-()/]{6,}/)
+    const phone = match ? match[0].replace(/\s+/g, '') : s
+    return clip(phone, 50)
+  }
+
   let imported = 0
   let updated = 0
   let skipped = 0
   const errors = []
+  const seen = new Set()
 
   for (let i = 0; i < rows.length; i++) {
     const row = rows[i]
     try {
-      const name = String(
-        row.name || row['Company name'] || row['Company Name'] || row.Name || ''
-      ).trim()
-      if (!name) {
-        errors.push(`Row ${i + 1}: Company name required`)
+      const name = clip(
+        row.name || row['Company name'] || row['Company Name'] || row.Name || '',
+        255
+      )
+      if (!name || name === '-' || /^sl\s*no\.?$/i.test(name)) {
+        skipped++
         continue
       }
+      const key = name.toLowerCase()
+      if (seen.has(key)) {
+        skipped++
+        continue
+      }
+      seen.add(key)
 
-      const address = String(row.address || row.Address || '').trim()
-      const state = String(row.state || row.State || '—').trim() || '—'
-      const city = String(row.city || row.City || state || '—').trim() || '—'
-      const gst = String(row.gst_no || row['GSTIN/UIN'] || row.GSTIN || row.GST || '').trim()
-      const email =
-        String(row.email || row.Email || '').trim() ||
-        `${name.toLowerCase().replace(/[^a-z0-9]+/g, '.').slice(0, 40)}@import.local`
-      const phone = String(row.phone || row.Phone || '—').trim() || '—'
+      const address = dash(row.address || row.Address)
+      const state = clip(row.state || row.State || '-', 100)
+      let city = String(row.city || row.City || '').trim()
+      if (!city && address && address !== '-') {
+        const parts = address
+          .split(',')
+          .map((p) => p.trim())
+          .filter(Boolean)
+        const last = parts[parts.length - 1] || ''
+        city = last.replace(/\d{5,6}/g, '').replace(/-/g, ' ').trim() || state
+      }
+      city = clip(city || state, 100)
+      const gst = clip(row.gst_no || row['GSTIN/UIN'] || row.GSTIN || row.GST || '-', 50)
+
+      // Never invent emails — blank in Excel → "-"
+      let emailRaw = String(row.email || row.Email || row['E-mail'] || '').trim()
+      if (/@import\.local$/i.test(emailRaw)) emailRaw = ''
+      const email = clip(emailRaw || '-', 255)
+
+      const phone = normalizePhone(
+        row.phone ||
+          row.Phone ||
+          row['Mobile No.'] ||
+          row['Mobile No'] ||
+          row.Mobile ||
+          row['Telephone No.'] ||
+          row['Telephone No'] ||
+          row.Telephone ||
+          ''
+      )
 
       const existing = await pool.query(
         'SELECT id FROM customers WHERE LOWER(name) = LOWER($1) LIMIT 1',
@@ -2710,12 +3006,12 @@ app.post('/api/customers/import', requireRoles(['admin', 'sales']), async (req, 
       if (existing.rows[0]) {
         await pool.query(
           `UPDATE customers SET
-            email = COALESCE(NULLIF($1, ''), email),
-            phone = COALESCE(NULLIF($2, ''), phone),
-            city = COALESCE(NULLIF($3, ''), city),
-            state = COALESCE(NULLIF($4, ''), state),
-            gst_no = COALESCE(NULLIF($5, ''), gst_no),
-            address = COALESCE(NULLIF($6, ''), address),
+            email = $1,
+            phone = $2,
+            city = $3,
+            state = $4,
+            gst_no = CASE WHEN $5 = '-' THEN '' ELSE $5 END,
+            address = CASE WHEN $6 = '-' THEN '' ELSE $6 END,
             updated_at = CURRENT_TIMESTAMP
            WHERE id = $7`,
           [email, phone, city, state, gst, address, existing.rows[0].id]
@@ -2724,8 +3020,17 @@ app.post('/api/customers/import', requireRoles(['admin', 'sales']), async (req, 
       } else {
         await pool.query(
           `INSERT INTO customers (name, email, phone, city, state, orders_count, total_amount, gst_no, address, created_by)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
-          [name, email, phone, city, state, 0, '₹ 0', gst, address, req.user.id]
+           VALUES ($1, $2, $3, $4, $5, 0, '₹ 0', $6, $7, $8)`,
+          [
+            name,
+            email,
+            phone,
+            city,
+            state,
+            gst === '-' ? '' : gst,
+            address === '-' ? '' : address,
+            req.user.id,
+          ]
         )
         imported++
       }
@@ -2735,7 +3040,6 @@ app.post('/api/customers/import', requireRoles(['admin', 'sales']), async (req, 
   }
   res.json({ imported, updated, skipped, total: rows.length, errors })
 })
-
 app.post('/api/products/import', requireRoles(['admin']), async (req, res) => {
   const { rows, namesOnly } = req.body
   if (!rows?.length) return res.status(400).json({ message: 'No rows to import.' })
@@ -2791,14 +3095,26 @@ app.post('/api/products/import', requireRoles(['admin']), async (req, res) => {
   res.json({ imported, skipped, total: rows.length, errors })
 })
 
-/** Import StkSum / product names into product_codes (Particulars → product code + name) */
+/** Import StkSum / product names into product_codes (Particulars → product + stock qty) */
 app.post('/api/product-codes/import', requireRoles(['admin', 'inventory']), async (req, res) => {
   const { rows } = req.body
   if (!rows?.length) return res.status(400).json({ message: 'No rows to import.' })
 
   let imported = 0
+  let updated = 0
   let skipped = 0
   const errors = []
+  const seen = new Set()
+
+  const skipName = (name) => {
+    if (!name) return true
+    if (/^\d+$/.test(name)) return true
+    if (/^grand total$/i.test(name)) return true
+    if (/^stock$/i.test(name)) return true
+    if (/^material\s*@/i.test(name)) return true
+    if (/^particulars$/i.test(name)) return true
+    return false
+  }
 
   const makeCode = (name, index) => {
     const base = String(name)
@@ -2813,27 +3129,50 @@ app.post('/api/product-codes/import', requireRoles(['admin', 'inventory']), asyn
     const row = rows[i]
     try {
       const name = String(row.Particulars || row.particulars || row.name || row.Name || '').trim()
-      if (!name || /^\d+$/.test(name) || /^grand total$/i.test(name)) {
+      if (skipName(name)) {
         skipped++
         continue
       }
+      const key = name.toLowerCase()
+      if (seen.has(key)) {
+        skipped++
+        continue
+      }
+      seen.add(key)
+
+      const stockRaw = Number(row.available ?? row.qty ?? row.Quantity ?? row.stock)
+      const stockQty = Number.isFinite(stockRaw) ? Math.max(0, Math.round(Math.abs(stockRaw))) : 0
 
       const existing = await pool.query(
-        'SELECT id FROM product_codes WHERE LOWER(name) = LOWER($1) OR LOWER(code) = LOWER($2) LIMIT 1',
-        [name, row.code || '']
+        'SELECT id, code FROM product_codes WHERE LOWER(name) = LOWER($1) LIMIT 1',
+        [name]
       )
+
       if (existing.rows[0]) {
-        skipped++
+        await pool.query(
+          `UPDATE product_codes
+           SET stock_qty = $1, updated_at = CURRENT_TIMESTAMP
+           WHERE id = $2`,
+          [stockQty, existing.rows[0].id]
+        )
+        updated++
         continue
       }
 
-      const code = String(row.code || '').trim().toUpperCase() || makeCode(name, i + 1)
-      const categoryName = String(row.category || row.Category || name).trim() || name
+      let code = String(row.code || '').trim().toUpperCase() || makeCode(name, i + 1)
+      // Ensure unique code
+      for (let attempt = 0; attempt < 5; attempt++) {
+        const clash = await pool.query('SELECT id FROM product_codes WHERE LOWER(code) = LOWER($1) LIMIT 1', [
+          code,
+        ])
+        if (!clash.rows[0]) break
+        code = makeCode(name, i + 1 + attempt * 17 + Date.now() % 97)
+      }
 
       await pool.query(
-        `INSERT INTO product_codes (code, name, description, created_by)
-         VALUES ($1, $2, $3, $4)`,
-        [code, categoryName, name, req.user.id]
+        `INSERT INTO product_codes (code, name, description, stock_qty, created_by, updated_at)
+         VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP)`,
+        [code, name, '', stockQty, req.user.id]
       )
       imported++
     } catch (e) {
@@ -2844,7 +3183,7 @@ app.post('/api/product-codes/import', requireRoles(['admin', 'inventory']), asyn
       errors.push(`Row ${i + 1}: ${e.message}`)
     }
   }
-  res.json({ imported, skipped, total: rows.length, errors })
+  res.json({ imported, updated, skipped, total: rows.length, errors })
 })
 
 app.post('/api/orders/import', requireRoles(['admin', 'sales']), async (req, res) => {

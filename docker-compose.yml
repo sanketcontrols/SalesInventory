@@ -26,13 +26,14 @@ services:
     environment:
       NODE_ENV: production
       PORT: 5000
-      DB_HOST: ${DB_HOST:-db}
-      DB_PORT: ${DB_PORT:-5432}
+      # Always use the compose Postgres service on NAS (do not use Render URL here)
+      DB_HOST: db
+      DB_PORT: '5432'
       DB_NAME: ${DB_NAME:-billing}
       DB_USER: ${DB_USER:-postgres}
       DB_PASSWORD: ${DB_PASSWORD:-changeme}
       JWT_SECRET: ${JWT_SECRET:-change-this-secret-in-production}
-      DB_SSL: ${DB_SSL:-false}
+      DB_SSL: 'false'
     depends_on:
       db:
         condition: service_healthy

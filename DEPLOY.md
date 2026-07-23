@@ -90,6 +90,13 @@ DB_PASSWORD=ChooseAStrongPassword123
 JWT_SECRET=ChooseALongRandomSecretKeyForJWT
 ```
 
+**Do not put Render `DATABASE_URL` in the NAS `.env`.**  
+Compose always connects the app to the local `db` container.
+
+> Password tip: `DB_PASSWORD` is baked into the Postgres volume on **first** start.  
+> If you change it later, login shows a database error. Fix: use the **original** password,  
+> or in Container Manager delete the `postgres_data` volume and start fresh (data loss).
+
 ### D. Start with Container Manager (Compose)
 1. Container Manager → **Project** → **Create**
 2. Path: `/docker/salesinventory` (or where you put files)
@@ -103,6 +110,9 @@ JWT_SECRET=ChooseALongRandomSecretKeyForJWT
 - `http://NAS_IP:5080`  
   Example: `http://192.168.1.50:5080`
 
+Check DB health in browser: `http://NAS_IP:5080/api/health`  
+Should show `"database":"connected"` and `"host":"db"`.
+
 > Synology DSM already uses **port 5000**. Postgres on NAS often uses **5432**.  
 > Compose defaults: app **5080**, DB host port **5433**. If you still see  
 > `driver failed programming external connectivity`, pick other free ports in `.env`.
@@ -111,6 +121,13 @@ First login (empty DB):
 - Email: `harsh@gmail.com`
 - Password: `123456`  
 Change password after login.
+
+### Login shows “Server error” on NAS?
+1. Open `http://NAS_IP:5080/api/health` — if disconnected, check Container Manager logs for `db` / `app`
+2. Confirm `.env` `DB_PASSWORD` matches the **first** password used for this project
+3. Confirm both containers are **Running**
+4. Rebuild after pulling latest code: project → **Build** → **Start**
+5. App logs should show: `DB config → host=db ... ssl=false`
 
 ### F. Copy your current data into NAS Postgres (optional)
 From your PC (with PostgreSQL tools):
