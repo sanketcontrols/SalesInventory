@@ -119,9 +119,26 @@ export async function initializeDatabase() {
     await pool.query(`ALTER TABLE inventory ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP`)
     await pool.query(`ALTER TABLE inventory ADD COLUMN IF NOT EXISTS required_qty INTEGER DEFAULT 0`)
     await pool.query(`ALTER TABLE inventory ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP`)
+    await pool.query(
+      `ALTER TABLE company_settings ADD COLUMN IF NOT EXISTS low_stock_target INTEGER NOT NULL DEFAULT 20`
+    )
     await pool.query(`ALTER TABLE customers ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP`)
     await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP`)
     await pool.query(`ALTER TABLE product_codes ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP`)
+    await pool.query(`ALTER TABLE product_codes ADD COLUMN IF NOT EXISTS stock_qty INTEGER NOT NULL DEFAULT 0`)
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS product_stock_movements (
+        id SERIAL PRIMARY KEY,
+        product_code_id INTEGER NOT NULL REFERENCES product_codes(id) ON DELETE CASCADE,
+        label VARCHAR(50) DEFAULT 'Stock',
+        qty INTEGER NOT NULL,
+        stock_after INTEGER NOT NULL DEFAULT 0,
+        movement_date VARCHAR(50) NOT NULL,
+        note TEXT DEFAULT '',
+        created_by INTEGER,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `)
     await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS product_code_id INTEGER`)
     await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS product_code VARCHAR(50)`)
     await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS product_name VARCHAR(255)`)
@@ -161,15 +178,22 @@ export async function initializeDatabase() {
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )
     `)
-    await pool.query(`ALTER TABLE order_items ADD COLUMN IF NOT EXISTS unit_price VARCHAR(50) DEFAULT '₹ 0'`)
-    await pool.query(`ALTER TABLE order_items ADD COLUMN IF NOT EXISTS description TEXT DEFAULT ''`)
     await pool.query(`
-      INSERT INTO order_items (order_id, product_code_id, product_code, product_name, qty, amount)
-      SELECT id, product_code_id, product_code, product_name, qty, amount
-      FROM orders o
-      WHERE product_code_id IS NOT NULL
-        AND NOT EXISTS (SELECT 1 FROM order_items oi WHERE oi.order_id = o.id)
+      CREATE TABLE IF NOT EXISTS monthly_qty_stats (
+        id SERIAL PRIMARY KEY,
+        kind VARCHAR(20) NOT NULL,
+        ref_id INTEGER NOT NULL,
+        year_month CHAR(7) NOT NULL,
+        qty NUMERIC(14, 2) NOT NULL DEFAULT 0,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE (kind, ref_id, year_month)
+      )
     `)
+    await pool.query(
+      `CREATE INDEX IF NOT EXISTS idx_monthly_qty_stats_lookup
+       ON monthly_qty_stats (kind, ref_id, year_month DESC)`
+    )
+
     await pool.query(`
       UPDATE orders
       SET stock_booked = TRUE
@@ -177,6 +201,10 @@ export async function initializeDatabase() {
         AND status <> 'Cancelled'
         AND (stock_booked IS NULL OR stock_booked = FALSE)
     `)
+
+    // Rename legacy inventory status label
+    await pool.query(`UPDATE inventory SET status = 'Stock Available' WHERE status = 'Normal'`)
+    await pool.query(`UPDATE inventory SET status = 'Defect' WHERE status = 'Critical'`)
 
     // Ensure primary admin account
     await pool.query(`UPDATE users SET role = 'admin' WHERE email = 'harsh@gmail.com'`)
@@ -271,9 +299,9 @@ export async function initializeDatabase() {
     const inventoryCheck = await pool.query('SELECT COUNT(*) FROM inventory')
     if (inventoryCheck.rows[0].count === '0') {
       const demoInventory = [
-        ['Relay 24V', 'RLY-24V-001', 120, 20, 5, 'Normal'],
+        ['Relay 24V', 'RLY-24V-001', 120, 20, 5, 'Stock Available'],
         ['Terminal Block', 'TRM-BLK-002', 18, 50, 10, 'Low Stock'],
-        ['MCB 63A', 'MCB-63A-003', 35, 10, 2, 'Normal'],
+        ['MCB 63A', 'MCB-63A-003', 35, 10, 2, 'Stock Available'],
       ]
       for (const item of demoInventory) {
         await pool.query(

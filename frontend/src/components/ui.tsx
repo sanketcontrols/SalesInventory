@@ -125,6 +125,7 @@ export const statusTone: Record<string, 'amber' | 'emerald' | 'rose' | 'slate'> 
   Completed: 'emerald',
   Cancelled: 'rose',
   Normal: 'emerald',
+  'Stock Available': 'emerald',
   'Low Stock': 'amber',
   Critical: 'rose',
   Defect: 'rose',
@@ -143,7 +144,7 @@ export function StatTile({
   label: string
   value: ReactNode
   hint?: string
-  accent?: 'blue' | 'emerald' | 'amber' | 'violet' | 'slate'
+  accent?: 'blue' | 'emerald' | 'amber' | 'violet' | 'slate' | 'rose'
 }) {
   const accents = {
     blue: 'from-blue-50 to-white text-blue-700',
@@ -151,6 +152,7 @@ export function StatTile({
     amber: 'from-amber-50 to-white text-amber-700',
     violet: 'from-violet-50 to-white text-violet-700',
     slate: 'from-slate-50 to-white text-slate-700',
+    rose: 'from-rose-50 to-white text-rose-700',
   }
   return (
     <div className={`rounded-2xl border border-slate-200/80 bg-gradient-to-b ${accents[accent]} px-4 py-3.5 shadow-sm shadow-slate-200/30`}>

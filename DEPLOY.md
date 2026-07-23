@@ -48,7 +48,125 @@ Works on any VPS (DigitalOcean, AWS, Hostinger, etc.) or your own server with Do
 
 ---
 
-## Option 2: VPS without Docker (manual)
+## Option 2: Synology NAS (office local deploy)
+
+Best for keeping **app + PostgreSQL inside your office** on Synology.
+
+### What you need
+- Synology NAS with **Container Manager** (DSM 7) or **Docker** (older DSM)
+- At least **2 GB free RAM** recommended
+- NAS local IP (example: `192.168.1.50`)
+
+### A. Install Container Manager
+1. Synology **Package Center** → search **Container Manager** → Install  
+2. Open **Container Manager**
+
+### B. Put project files on NAS
+1. In **File Station**, create folder: `docker/salesinventory`
+2. Copy your whole project into that folder (from PC or GitHub):
+   - `Dockerfile`
+   - `docker-compose.yml`
+   - `.env`
+   - `frontend/`
+   - `backend/`
+   - etc.
+
+Or via SSH:
+```bash
+cd /volume1/docker
+git clone https://github.com/sanketcontrols/SalesInventory.git salesinventory
+cd salesinventory
+```
+
+### C. Create `.env` on NAS
+In `docker/salesinventory` create file `.env`:
+```env
+# IMPORTANT on Synology: DSM already uses port 5000 — do NOT use 5000
+APP_PORT=5080
+DB_NAME=billing
+DB_USER=postgres
+DB_PASSWORD=ChooseAStrongPassword123
+JWT_SECRET=ChooseALongRandomSecretKeyForJWT
+```
+
+### D. Start with Container Manager (Compose)
+1. Container Manager → **Project** → **Create**
+2. Path: `/docker/salesinventory` (or where you put files)
+3. Source: `docker-compose.yml`
+4. Create / Build / Start
+5. Wait until both containers are **Running**:
+   - `salesinventory-db-1` (PostgreSQL)
+   - `salesinventory-app-1` (your app)
+
+### E. Open the app in office
+- `http://NAS_IP:5080`  
+  Example: `http://192.168.1.50:5080`
+
+> Synology DSM already uses **port 5000**. If you map the app to 5000, Docker fails with  
+> `driver failed programming external connectivity`. Always use **5080** (or another free port).
+
+First login (empty DB):
+- Email: `harsh@gmail.com`
+- Password: `123456`  
+Change password after login.
+
+### F. Copy your current data into NAS Postgres (optional)
+From your PC (with PostgreSQL tools):
+
+1. Export from current DB (Render or local):
+```bash
+pg_dump -h YOUR_CURRENT_HOST -p 5432 -U YOUR_USER -d YOUR_DB -F c -f billing_backup.dump
+```
+
+2. Restore into Synology Postgres (port mapped if needed):
+```bash
+pg_restore --clean --if-exists --no-owner --no-acl -h NAS_IP -p 5432 -U postgres -d billing billing_backup.dump
+```
+
+If Postgres port is only inside Docker network, use:
+```bash
+# on NAS via SSH
+cd /volume1/docker/salesinventory
+sudo docker compose exec -T db pg_restore --clean --if-exists --no-owner --no-acl -U postgres -d billing < billing_backup.dump
+```
+(Copy the dump file onto NAS first.)
+
+### G. Useful Synology commands (SSH)
+Enable SSH: **Control Panel → Terminal & SNMP → Enable SSH**
+
+```bash
+cd /volume1/docker/salesinventory
+sudo docker compose ps
+sudo docker compose logs -f app
+sudo docker compose up -d --build    # after code update
+sudo docker compose down             # stop
+```
+
+### H. Office network tips
+- Keep NAS on a **fixed LAN IP**
+- Open port **5000** only on office LAN (not public internet unless you use VPN / reverse proxy)
+- Optional: Synology **Login Portal / Reverse Proxy** for HTTPS with office domain
+
+### Point local PC app to NAS DB (optional)
+If you want PC development to use NAS database, set `backend/.env`:
+```env
+DB_HOST=192.168.1.50
+DB_PORT=5432
+DB_NAME=billing
+DB_USER=postgres
+DB_PASSWORD=ChooseAStrongPassword123
+JWT_SECRET=same-as-nas
+```
+And expose Postgres in `docker-compose.yml` ports:
+```yaml
+ports:
+  - "5432:5432"
+```
+Only do this on a trusted office network.
+
+---
+
+## Option 3: VPS without Docker (manual)
 
 For Ubuntu/Debian VPS with Node 22 and PostgreSQL already installed.
 

@@ -55,39 +55,86 @@ async function getProductCodeItems(productCodeId, client = pool) {
      ORDER BY i.name`,
     [productCodeId]
   )
-  return result.rows.map((row) => ({
-    ...row,
-    available: Number(row.available) || 0,
-    booked: Number(row.booked) || 0,
-    pending: Number(row.booked) || 0,
-  }))
+  return result.rows.map((row) => {
+    const booked = Number(row.booked) || 0
+    return {
+      ...row,
+      available: Number(row.available) || 0,
+      booked,
+      pending: booked,
+      required_qty: booked,
+    }
+  })
 }
 
-function inventoryStatus(available, requiredQty = 0) {
-  if (available < 0) return 'Defect'
-  if (available <= 0) return 'Defect'
-  if (requiredQty > 0 && available < requiredQty) return 'Low Stock'
-  if (available <= 20) return 'Low Stock'
-  return 'Normal'
+/** Cached low-stock target from company_settings (available < target → Low Stock) */
+let lowStockTargetCache = { value: 20, at: 0 }
+
+function invalidateLowStockTargetCache() {
+  lowStockTargetCache.at = 0
 }
 
-function mapInventoryRow(row) {
+async function getLowStockTarget(client = pool) {
+  if (Date.now() - lowStockTargetCache.at < 5000) return lowStockTargetCache.value
+  try {
+    const result = await client.query(
+      `SELECT COALESCE(low_stock_target, 20)::int AS low_stock_target
+       FROM company_settings
+       ORDER BY id
+       LIMIT 1`
+    )
+    const value = Math.max(0, Number(result.rows[0]?.low_stock_target) || 20)
+    lowStockTargetCache = { value, at: Date.now() }
+    return value
+  } catch {
+    return lowStockTargetCache.value || 20
+  }
+}
+
+function inventoryStatus(available, requiredQty = 0, lowStockTarget = lowStockTargetCache.value || 20) {
+  const avail = Number(available) || 0
+  const target = Math.max(0, Number(lowStockTarget) || 20)
+  if (avail < 0) return 'Defect'
+  if (avail <= 0) return 'Defect'
+  if (requiredQty > 0 && avail < requiredQty) return 'Low Stock'
+  if (avail < target) return 'Low Stock'
+  return 'Stock Available'
+}
+
+function mapInventoryRow(row, lowStockTarget = lowStockTargetCache.value || 20) {
   if (!row) return row
   const available = Number(row.available) || 0
-  // Booked = qty reserved by Pending sales orders (live from sales_required)
+  // Booked / Required = qty reserved by Pending sales orders
   const booked = Number(row.sales_required ?? row.pending) || 0
+  const used = Number(row.qty_used ?? row.used) || 0
   return {
     ...row,
     qty: available,
     available,
     required_qty: booked,
     sales_required: booked,
+    qty_used: used,
+    used,
     monthly_avg: Number(row.monthly_avg) || 0,
     booked,
     pending: booked,
     remaining: available,
-    status: row.status || inventoryStatus(available, booked),
+    status: inventoryStatus(available, booked, lowStockTarget),
   }
+}
+
+async function refreshAllInventoryStatuses(client = pool) {
+  const target = await getLowStockTarget(client)
+  const rows = await client.query('SELECT id, available FROM inventory')
+  for (const row of rows.rows) {
+    const booked = await getBookedQtyForInventory(row.id, client)
+    const status = inventoryStatus(Number(row.available), booked, target)
+    await client.query(
+      `UPDATE inventory SET pending = $1, status = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $3`,
+      [booked, status, row.id]
+    )
+  }
+  return target
 }
 
 async function getBookedQtyForInventory(inventoryId, client = pool) {
@@ -102,9 +149,109 @@ async function getBookedQtyForInventory(inventoryId, client = pool) {
   return Number(result.rows[0]?.booked) || 0
 }
 
+/** Calendar month key YYYY-MM (resets each month). Uses closed_at for completed sales. */
+function currentYearMonth() {
+  const d = new Date()
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`
+}
+
+function formatYearMonthLabel(ym) {
+  const [y, m] = String(ym || '').split('-')
+  const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+  const mi = Number(m) - 1
+  if (!y || mi < 0 || mi > 11) return String(ym || '—')
+  return `${months[mi]} ${y}`
+}
+
+/** Recompute + store monthly sold qty for one product (Completed orders). */
+async function syncProductMonthlyStats(productCodeId, client = pool) {
+  await client.query(
+    `INSERT INTO monthly_qty_stats (kind, ref_id, year_month, qty, updated_at)
+     SELECT
+       'product',
+       $1::int,
+       TO_CHAR(COALESCE(o.closed_at, o.created_at), 'YYYY-MM'),
+       SUM(oi.qty)::numeric,
+       CURRENT_TIMESTAMP
+     FROM order_items oi
+     JOIN orders o ON o.id = oi.order_id
+     WHERE oi.product_code_id = $1
+       AND o.status = 'Completed'
+     GROUP BY TO_CHAR(COALESCE(o.closed_at, o.created_at), 'YYYY-MM')
+     ON CONFLICT (kind, ref_id, year_month)
+     DO UPDATE SET qty = EXCLUDED.qty, updated_at = CURRENT_TIMESTAMP`,
+    [productCodeId]
+  )
+}
+
+/** Recompute + store monthly used qty for one inventory part (Completed BOM usage). */
+async function syncInventoryMonthlyStats(inventoryId, client = pool) {
+  await client.query(
+    `INSERT INTO monthly_qty_stats (kind, ref_id, year_month, qty, updated_at)
+     SELECT
+       'inventory',
+       $1::int,
+       TO_CHAR(COALESCE(o.closed_at, o.created_at), 'YYYY-MM'),
+       SUM(pci.qty_per_unit * oi.qty)::numeric,
+       CURRENT_TIMESTAMP
+     FROM product_code_items pci
+     JOIN order_items oi ON oi.product_code_id = pci.product_code_id
+     JOIN orders o ON o.id = oi.order_id
+     WHERE pci.inventory_id = $1
+       AND o.status = 'Completed'
+     GROUP BY TO_CHAR(COALESCE(o.closed_at, o.created_at), 'YYYY-MM')
+     ON CONFLICT (kind, ref_id, year_month)
+     DO UPDATE SET qty = EXCLUDED.qty, updated_at = CURRENT_TIMESTAMP`,
+    [inventoryId]
+  )
+}
+
+async function getStoredMonthlyStats(kind, refId, client = pool) {
+  const result = await client.query(
+    `SELECT year_month, qty::float AS qty
+     FROM monthly_qty_stats
+     WHERE kind = $1 AND ref_id = $2
+     ORDER BY year_month DESC`,
+    [kind, refId]
+  )
+  const thisMonth = currentYearMonth()
+  return result.rows.map((row) => ({
+    year_month: row.year_month,
+    label: formatYearMonthLabel(row.year_month),
+    qty: Number(row.qty) || 0,
+    is_current: row.year_month === thisMonth,
+  }))
+}
+
+async function getCurrentMonthQty(kind, refId, client = pool) {
+  const ym = currentYearMonth()
+  const result = await client.query(
+    `SELECT qty::float AS qty FROM monthly_qty_stats
+     WHERE kind = $1 AND ref_id = $2 AND year_month = $3`,
+    [kind, refId, ym]
+  )
+  return Number(result.rows[0]?.qty) || 0
+}
+
 async function checkStockForProductCode(productCodeId, multiplier, client = pool) {
   const items = await getProductCodeItems(productCodeId, client)
   const warnings = []
+  const codeRes = await client.query(
+    'SELECT code, name, COALESCE(stock_qty, 0)::int AS stock_qty FROM product_codes WHERE id = $1',
+    [productCodeId]
+  )
+  const stockQty = Number(codeRes.rows[0]?.stock_qty) || 0
+  if (stockQty < multiplier) {
+    warnings.push({
+      name: codeRes.rows[0]?.code || `Product #${productCodeId}`,
+      sku: 'product',
+      needed: multiplier,
+      available: stockQty,
+      remaining: stockQty - multiplier,
+      message: `Product stock: need ${multiplier}, available ${stockQty}, short by ${multiplier - stockQty}`,
+      kind: 'product',
+    })
+  }
   for (const item of items) {
     const needed = item.qty_per_unit * multiplier
     if (item.available < needed) {
@@ -115,16 +262,33 @@ async function checkStockForProductCode(productCodeId, multiplier, client = pool
         available: item.available,
         remaining: Math.max(0, item.available - needed),
         message: `${item.name}: need ${needed}, available ${item.available}, short by ${needed - item.available}`,
+        kind: 'inventory',
       })
     }
   }
   return warnings
 }
 
+async function adjustProductStockQty(productCodeId, qtyDelta, client = pool) {
+  // qtyDelta: negative to deduct sold qty, positive to restore
+  await client.query(
+    `UPDATE product_codes
+     SET stock_qty = COALESCE(stock_qty, 0) + $1,
+         updated_at = CURRENT_TIMESTAMP
+     WHERE id = $2`,
+    [qtyDelta, productCodeId]
+  )
+}
+
 async function adjustStockForProductCode(productCodeId, multiplier, direction, client = pool) {
-  // direction: 1 = book/reserve, -1 = release/restore
+  // direction: 1 = book/reserve (deduct inventory + product), -1 = release/restore
   // available can go negative when stock is short (MFG shows red)
+  const target = await getLowStockTarget(client)
   const items = await getProductCodeItems(productCodeId, client)
+
+  // Product finished-goods stock
+  await adjustProductStockQty(productCodeId, -multiplier * direction, client)
+
   for (const item of items) {
     const delta = item.qty_per_unit * multiplier * direction
     const row = (
@@ -138,7 +302,7 @@ async function adjustStockForProductCode(productCodeId, multiplier, direction, c
     const newPending = Math.max(0, Number(row.pending || 0) + delta)
     const newReserved = Math.max(0, Number(row.reserved || 0) + delta)
     // Status from remaining available vs sales-booked demand (pending)
-    const status = inventoryStatus(newAvailable, newPending)
+    const status = inventoryStatus(newAvailable, newPending, target)
 
     await client.query(
       'UPDATE inventory SET available = $1, pending = $2, reserved = $3, status = $4, updated_at = CURRENT_TIMESTAMP WHERE id = $5',
@@ -657,9 +821,11 @@ app.get('/api/notifications', authMiddleware, async (req, res) => {
 
 app.get('/api/company/settings', authMiddleware, async (req, res) => {
   try {
-    const result = await pool.query('SELECT company_name, address, gst_no, updated_at FROM company_settings ORDER BY id LIMIT 1')
+    const result = await pool.query(
+      'SELECT company_name, address, gst_no, COALESCE(low_stock_target, 20)::int AS low_stock_target, updated_at FROM company_settings ORDER BY id LIMIT 1'
+    )
     if (result.rows.length === 0) {
-      return res.json({ company_name: 'Purn Sanket Electrols', address: '', gst_no: '' })
+      return res.json({ company_name: 'Purn Sanket Electrols', address: '', gst_no: '', low_stock_target: 20 })
     }
     res.json(result.rows[0])
   } catch (error) {
@@ -669,27 +835,83 @@ app.get('/api/company/settings', authMiddleware, async (req, res) => {
 })
 
 app.put('/api/company/settings', requireRoles(['admin']), async (req, res) => {
-  const { company_name, address, gst_no } = req.body
+  const { company_name, address, gst_no, low_stock_target } = req.body
   if (!company_name) {
     return res.status(400).json({ message: 'Company name is required.' })
   }
   try {
-    const existing = await pool.query('SELECT id FROM company_settings ORDER BY id LIMIT 1')
+    const existing = await pool.query(
+      'SELECT id, COALESCE(low_stock_target, 20)::int AS low_stock_target FROM company_settings ORDER BY id LIMIT 1'
+    )
+    const target =
+      low_stock_target != null && Number.isFinite(Number(low_stock_target))
+        ? Math.max(0, Math.floor(Number(low_stock_target)))
+        : existing.rows[0]
+          ? Number(existing.rows[0].low_stock_target)
+          : 20
     let result
     if (existing.rows.length === 0) {
       result = await pool.query(
-        'INSERT INTO company_settings (company_name, address, gst_no) VALUES ($1, $2, $3) RETURNING company_name, address, gst_no, updated_at',
-        [company_name, address || '', gst_no || '']
+        `INSERT INTO company_settings (company_name, address, gst_no, low_stock_target)
+         VALUES ($1, $2, $3, $4)
+         RETURNING company_name, address, gst_no, low_stock_target, updated_at`,
+        [company_name, address || '', gst_no || '', target]
       )
     } else {
       result = await pool.query(
-        'UPDATE company_settings SET company_name = $1, address = $2, gst_no = $3, updated_at = CURRENT_TIMESTAMP WHERE id = $4 RETURNING company_name, address, gst_no, updated_at',
-        [company_name, address || '', gst_no || '', existing.rows[0].id]
+        `UPDATE company_settings
+         SET company_name = $1, address = $2, gst_no = $3, low_stock_target = $4, updated_at = CURRENT_TIMESTAMP
+         WHERE id = $5
+         RETURNING company_name, address, gst_no, low_stock_target, updated_at`,
+        [company_name, address || '', gst_no || '', target, existing.rows[0].id]
       )
+    }
+    if (low_stock_target != null && Number.isFinite(Number(low_stock_target))) {
+      invalidateLowStockTargetCache()
+      await refreshAllInventoryStatuses()
     }
     res.json(result.rows[0])
   } catch (error) {
     console.error('Company settings update error:', error)
+    res.status(500).json({ message: 'Server error' })
+  }
+})
+
+/** Low stock target — available qty below this number shows Low Stock */
+app.get('/api/inventory/settings', requireRoles(['admin', 'inventory', 'sales']), async (req, res) => {
+  try {
+    const low_stock_target = await getLowStockTarget()
+    res.json({ low_stock_target })
+  } catch (error) {
+    console.error('Inventory settings fetch error:', error)
+    res.status(500).json({ message: 'Server error' })
+  }
+})
+
+app.put('/api/inventory/settings', requireRoles(['admin', 'inventory']), async (req, res) => {
+  const target = Math.max(0, Math.floor(Number(req.body?.low_stock_target)))
+  if (!Number.isFinite(target)) {
+    return res.status(400).json({ message: 'Enter a valid low stock target (0 or more).' })
+  }
+  try {
+    const existing = await pool.query('SELECT id FROM company_settings ORDER BY id LIMIT 1')
+    if (existing.rows.length === 0) {
+      await pool.query(
+        `INSERT INTO company_settings (company_name, address, gst_no, low_stock_target)
+         VALUES ('Purn Sanket Electrols', '', '', $1)`,
+        [target]
+      )
+    } else {
+      await pool.query(
+        `UPDATE company_settings SET low_stock_target = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`,
+        [target, existing.rows[0].id]
+      )
+    }
+    invalidateLowStockTargetCache()
+    await refreshAllInventoryStatuses()
+    res.json({ low_stock_target: target })
+  } catch (error) {
+    console.error('Inventory settings update error:', error)
     res.status(500).json({ message: 'Server error' })
   }
 })
@@ -1006,10 +1228,11 @@ app.post('/api/orders/stock-check', requireRoles(['admin', 'sales']), async (req
   try {
     const items = Array.isArray(req.body.items) ? req.body.items : []
     if (items.length === 0) {
-      return res.json({ breakdown: [], warnings: [], stockOk: true })
+      return res.json({ breakdown: [], products: [], warnings: [], stockOk: true })
     }
 
     const breakdown = []
+    const products = []
     const warnings = []
 
     for (const line of items) {
@@ -1017,8 +1240,40 @@ app.post('/api/orders/stock-check', requireRoles(['admin', 'sales']), async (req
       const qty = Number(line.qty) || 0
       if (!codeId || qty <= 0) continue
 
-      const codeRes = await pool.query('SELECT code, name FROM product_codes WHERE id = $1', [codeId])
+      const codeRes = await pool.query(
+        'SELECT code, name, COALESCE(stock_qty, 0)::int AS stock_qty FROM product_codes WHERE id = $1',
+        [codeId]
+      )
       const label = codeRes.rows[0] ? `${codeRes.rows[0].code}` : `Product #${codeId}`
+      const stockQty = Math.max(0, Number(codeRes.rows[0]?.stock_qty) || 0)
+      const productRemaining = stockQty - qty
+
+      products.push({
+        product_code_id: codeId,
+        product: label,
+        name: codeRes.rows[0]?.name || label,
+        available: stockQty,
+        booked: qty,
+        remaining: productRemaining,
+        in_stock: productRemaining >= 0,
+      })
+
+      breakdown.push({
+        type: 'product',
+        product: label,
+        inventory_id: null,
+        name: `${label} — Product available`,
+        sku: '',
+        qty_per_unit: 1,
+        product_qty: qty,
+        available: stockQty,
+        booked: qty,
+        remaining: productRemaining,
+        total_qty: qty,
+        in_stock: productRemaining >= 0,
+        display: `${label}: Product stock × ${qty}`,
+      })
+
       const lineWarnings = await checkStockForProductCode(codeId, qty)
       const codeItems = await getProductCodeItems(codeId)
 
@@ -1026,6 +1281,7 @@ app.post('/api/orders/stock-check', requireRoles(['admin', 'sales']), async (req
         const booked = item.qty_per_unit * qty
         const remaining = item.available - booked
         breakdown.push({
+          type: 'inventory',
           product: label,
           inventory_id: item.inventory_id,
           name: item.name,
@@ -1046,7 +1302,7 @@ app.post('/api/orders/stock-check', requireRoles(['admin', 'sales']), async (req
       }
     }
 
-    res.json({ breakdown, warnings, stockOk: warnings.length === 0 })
+    res.json({ breakdown, products, warnings, stockOk: warnings.length === 0 })
   } catch (error) {
     console.error('Multi stock check error:', error)
     res.status(500).json({ message: 'Server error' })
@@ -1326,7 +1582,25 @@ app.put('/api/orders/:id', requireRoles(['admin', 'sales']), async (req, res) =>
     )
 
     await client.query('COMMIT')
-    res.json(await enrichOrder(result.rows[0], items, client))
+
+    // Refresh stored monthly sold/used when an order is completed (or reopened)
+    if (nextStatus === 'Completed' || existing.status === 'Completed') {
+      const productIds = [
+        ...new Set(items.map((it) => Number(it.product_code_id)).filter((n) => Number.isFinite(n) && n > 0)),
+      ]
+      for (const pid of productIds) {
+        await syncProductMonthlyStats(pid).catch(() => {})
+        const bom = await pool.query(
+          'SELECT DISTINCT inventory_id FROM product_code_items WHERE product_code_id = $1',
+          [pid]
+        )
+        for (const row of bom.rows) {
+          await syncInventoryMonthlyStats(Number(row.inventory_id)).catch(() => {})
+        }
+      }
+    }
+
+    res.json(await enrichOrder(result.rows[0], items, pool))
   } catch (error) {
     await client.query('ROLLBACK')
     console.error('Error updating order:', error)
@@ -1379,54 +1653,259 @@ app.get('/api/customers/:id/orders', requireRoles(['admin', 'sales']), async (re
 
     const companyName = customerRes.rows[0].name
     const { month, year } = req.query
-    let query = 'SELECT * FROM orders WHERE company ILIKE $1'
-    const params = [companyName]
 
-    if (month && year) {
-      params.push(Number(year), Number(month))
-      query += ` AND EXTRACT(YEAR FROM created_at) = $2 AND EXTRACT(MONTH FROM created_at) = $3`
-    } else if (year) {
-      params.push(Number(year))
-      query += ` AND EXTRACT(YEAR FROM created_at) = $2`
-    }
-
-    query += ` ORDER BY
-      CASE WHEN order_no ~ '^FY[0-9]{2}-[0-9]{2}_' THEN 0 ELSE 1 END,
-      order_no DESC,
-      created_at DESC`
-    const ordersResult = await pool.query(query, params)
-    const orders = await Promise.all(
-      ordersResult.rows.map(async (order) => {
+    const allOrdersResult = await pool.query(
+      `SELECT * FROM orders WHERE company ILIKE $1
+       ORDER BY
+         CASE WHEN order_no ~ '^FY[0-9]{2}-[0-9]{2}_' THEN 0 ELSE 1 END,
+         order_no DESC,
+         created_at DESC`,
+      [companyName]
+    )
+    const allOrders = await Promise.all(
+      allOrdersResult.rows.map(async (order) => {
         const items = await getOrderItems(order.id)
         return enrichOrder(order, items)
       })
     )
 
-    const [total, pending, completed, thisMonth, amounts] = await Promise.all([
-      pool.query('SELECT COUNT(*)::int AS count FROM orders WHERE company ILIKE $1', [companyName]),
-      pool.query("SELECT COUNT(*)::int AS count FROM orders WHERE company ILIKE $1 AND status = 'Pending'", [companyName]),
-      pool.query("SELECT COUNT(*)::int AS count FROM orders WHERE company ILIKE $1 AND status = 'Completed'", [companyName]),
-      pool.query(
-        `SELECT COUNT(*)::int AS count FROM orders WHERE company ILIKE $1 AND created_at >= date_trunc('month', CURRENT_DATE)`,
-        [companyName]
-      ),
-      pool.query(`SELECT amount FROM orders WHERE company ILIKE $1 AND status != 'Cancelled'`, [companyName]),
-    ])
+    let orders = allOrders
+    if (month && year) {
+      const m = Number(month)
+      const y = Number(year)
+      orders = allOrders.filter((o) => {
+        const d = new Date(o.created_at)
+        return !Number.isNaN(d.getTime()) && d.getFullYear() === y && d.getMonth() + 1 === m
+      })
+    } else if (year) {
+      const y = Number(year)
+      orders = allOrders.filter((o) => {
+        const d = new Date(o.created_at)
+        return !Number.isNaN(d.getTime()) && d.getFullYear() === y
+      })
+    }
 
-    const totalRevenue = amounts.rows.reduce((sum, row) => sum + parseAmount(row.amount), 0)
+    const bomRes = await pool.query(
+      `SELECT pci.product_code_id, pci.inventory_id, pci.qty_per_unit, i.name AS inventory_name, COALESCE(i.sku, '') AS sku
+       FROM product_code_items pci
+       JOIN inventory i ON i.id = pci.inventory_id`
+    )
+    const bomByProduct = new Map()
+    for (const row of bomRes.rows) {
+      const pid = Number(row.product_code_id)
+      const list = bomByProduct.get(pid) || []
+      list.push({
+        inventory_id: Number(row.inventory_id),
+        qty_per_unit: Number(row.qty_per_unit) || 1,
+        name: row.inventory_name,
+        sku: row.sku,
+      })
+      bomByProduct.set(pid, list)
+    }
+
+    const orderRevenue = (o) => {
+      const fromItems = (o.items || []).reduce((sum, it) => sum + parseAmount(it.amount), 0)
+      return fromItems > 0 ? fromItems : parseAmount(o.amount)
+    }
+    const orderQty = (o) => {
+      const fromItems = (o.items || []).reduce((sum, it) => sum + (Number(it.qty) || 0), 0)
+      return fromItems > 0 ? fromItems : Number(o.qty) || 0
+    }
+    const eventDate = (o) => {
+      const raw = o.closed_at || o.created_at || o.updated_at
+      const d = raw ? new Date(raw) : new Date()
+      return Number.isNaN(d.getTime()) ? new Date() : d
+    }
+    const ymKey = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`
+
+    const now = new Date()
+    const thisYm = ymKey(now)
+    const fy = getFinancialYear(now)
+    const fyStart = new Date(fy.startYear, 3, 1)
+    const fyEnd = new Date(fy.endYear, 2, 31, 23, 59, 59)
+    const inThisMonth = (o) => ymKey(eventDate(o)) === thisYm
+    const inFy = (o) => {
+      const d = eventDate(o)
+      return d >= fyStart && d <= fyEnd
+    }
+
+    const active = allOrders.filter((o) => o.status !== 'Cancelled')
+    const completedList = allOrders.filter((o) => o.status === 'Completed')
+    const pendingList = allOrders.filter((o) => o.status === 'Pending')
+
+    const completedRevenue = completedList.reduce((s, o) => s + orderRevenue(o), 0)
+    const activeRevenue = active.reduce((s, o) => s + orderRevenue(o), 0)
+    const revenueBase = completedRevenue > 0 ? completedRevenue : activeRevenue
+    const revenueList = completedRevenue > 0 ? completedList : active
+
+    const firstAt = active.reduce((min, o) => {
+      const d = eventDate(o)
+      return !min || d < min ? d : min
+    }, null)
+    const monthsActive = (() => {
+      if (!firstAt) return 1
+      return Math.max(
+        1,
+        (now.getFullYear() - firstAt.getFullYear()) * 12 + (now.getMonth() - firstAt.getMonth()) + 1
+      )
+    })()
+    const fyMonthsElapsed = Math.max(1, now.getMonth() >= 3 ? now.getMonth() - 2 : now.getMonth() + 10)
+
+    const fyRevenue = revenueList.filter(inFy).reduce((s, o) => s + orderRevenue(o), 0)
+    const monthlyAvgRevenue = Math.round(revenueBase / monthsActive)
+    const ordersThisMonth = allOrders.filter((o) => ymKey(new Date(o.created_at || o.closed_at || Date.now())) === thisYm).length
+
     const filteredRevenue = orders
       .filter((o) => o.status !== 'Cancelled')
-      .reduce((sum, o) => sum + parseAmount(o.amount), 0)
+      .reduce((sum, o) => sum + orderRevenue(o), 0)
+
+    // Per-product summary
+    const productMap = new Map()
+    for (const o of allOrders) {
+      if (o.status === 'Cancelled') continue
+      const lines =
+        o.items?.length > 0
+          ? o.items
+          : [
+              {
+                product_code: o.product_code,
+                product_name: o.product_name,
+                product_code_id: o.product_code_id,
+                qty: o.qty,
+                amount: o.amount,
+              },
+            ]
+      for (const it of lines) {
+        const code = it.product_code || '—'
+        const key = `${it.product_code_id || ''}|${code}`
+        const row = productMap.get(key) || {
+          product_code_id: it.product_code_id ? Number(it.product_code_id) : null,
+          product_code: code,
+          product_name: it.product_name || '—',
+          pending_qty: 0,
+          sold_qty: 0,
+          lifetime_revenue: 0,
+          fy_revenue: 0,
+          this_month_revenue: 0,
+          orders_count: 0,
+          orderIds: new Set(),
+          monthKeys: new Set(),
+        }
+        const qty = Number(it.qty) || 0
+        const amt =
+          parseAmount(it.amount) ||
+          (lines.length === 1 ? orderRevenue(o) : 0)
+        row.orderIds.add(o.id)
+        if (o.status === 'Pending') row.pending_qty += qty
+        if (o.status === 'Completed') {
+          row.sold_qty += qty
+          row.lifetime_revenue += amt
+          row.monthKeys.add(ymKey(eventDate(o)))
+          if (inFy(o)) row.fy_revenue += amt
+          if (inThisMonth(o)) row.this_month_revenue += amt
+        }
+        productMap.set(key, row)
+      }
+    }
+
+    const products = [...productMap.values()]
+      .map((row) => {
+        const activeMonths = Math.max(1, row.monthKeys.size || monthsActive)
+        return {
+          product_code_id: row.product_code_id,
+          product_code: row.product_code,
+          product_name: row.product_name,
+          pending_qty: row.pending_qty,
+          sold_qty: row.sold_qty,
+          orders_count: row.orderIds.size,
+          monthly_avg_revenue: Math.round(row.lifetime_revenue / activeMonths),
+          monthly_avg_revenue_label: formatRupee(Math.round(row.lifetime_revenue / activeMonths)),
+          fy_revenue: row.fy_revenue,
+          fy_revenue_label: formatRupee(row.fy_revenue),
+          lifetime_revenue: row.lifetime_revenue,
+          lifetime_revenue_label: formatRupee(row.lifetime_revenue),
+          this_month_revenue: row.this_month_revenue,
+          this_month_revenue_label: formatRupee(row.this_month_revenue),
+          monthly_avg_qty: Math.round((row.sold_qty / activeMonths) * 10) / 10,
+          active_months: activeMonths,
+        }
+      })
+      .sort((a, b) => b.lifetime_revenue - a.lifetime_revenue || a.product_code.localeCompare(b.product_code))
+
+    // Per-inventory usage for this company (BOM × order qty)
+    const invMap = new Map()
+    for (const o of allOrders) {
+      if (o.status === 'Cancelled') continue
+      const lines =
+        o.items?.length > 0
+          ? o.items
+          : [{ product_code_id: o.product_code_id, qty: o.qty }]
+      for (const it of lines) {
+        const pid = Number(it.product_code_id)
+        if (!pid) continue
+        const bom = bomByProduct.get(pid) || []
+        const qty = Number(it.qty) || 0
+        for (const part of bom) {
+          const used = part.qty_per_unit * qty
+          const row = invMap.get(part.inventory_id) || {
+            inventory_id: part.inventory_id,
+            name: part.name,
+            sku: part.sku,
+            pending_qty: 0,
+            used_qty: 0,
+            fy_qty: 0,
+            this_month_qty: 0,
+            monthKeys: new Set(),
+          }
+          if (o.status === 'Pending') row.pending_qty += used
+          if (o.status === 'Completed') {
+            row.used_qty += used
+            row.monthKeys.add(ymKey(eventDate(o)))
+            if (inFy(o)) row.fy_qty += used
+            if (inThisMonth(o)) row.this_month_qty += used
+          }
+          invMap.set(part.inventory_id, row)
+        }
+      }
+    }
+
+    const inventory = [...invMap.values()]
+      .map((row) => {
+        const activeMonths = Math.max(1, row.monthKeys.size || monthsActive)
+        return {
+          inventory_id: row.inventory_id,
+          name: row.name,
+          sku: row.sku,
+          pending_qty: row.pending_qty,
+          used_qty: row.used_qty,
+          this_month_qty: row.this_month_qty,
+          fy_qty: row.fy_qty,
+          lifetime_qty: row.used_qty,
+          monthly_avg_qty: Math.round((row.used_qty / activeMonths) * 10) / 10,
+          active_months: activeMonths,
+        }
+      })
+      .sort((a, b) => b.used_qty - a.used_qty || a.name.localeCompare(b.name))
 
     res.json({
       customer: customerRes.rows[0],
       orders,
+      products,
+      inventory,
       stats: {
-        totalOrders: total.rows[0].count,
-        pendingOrders: pending.rows[0].count,
-        completedOrders: completed.rows[0].count,
-        ordersThisMonth: thisMonth.rows[0].count,
-        totalRevenue: formatRupee(totalRevenue),
+        totalOrders: allOrders.length,
+        pendingOrders: pendingList.length,
+        completedOrders: completedList.length,
+        ordersThisMonth,
+        monthly_avg_revenue: formatRupee(monthlyAvgRevenue),
+        monthly_avg_revenue_raw: monthlyAvgRevenue,
+        fy_label: `FY ${fy.label}`,
+        fy_revenue: formatRupee(fyRevenue),
+        fy_revenue_raw: fyRevenue,
+        totalRevenue: formatRupee(activeRevenue),
+        lifetime_revenue_raw: activeRevenue,
+        months_active: monthsActive,
+        fy_months_elapsed: fyMonthsElapsed,
         filteredRevenue: formatRupee(filteredRevenue),
         filteredOrders: orders.length,
       },
@@ -1591,13 +2070,22 @@ app.get('/api/inventory', requireRoles(['admin', 'inventory', 'sales']), async (
             AND o.status = 'Pending'
         ), 0)::int AS sales_required,
         COALESCE((
-          SELECT ROUND(SUM(pci.qty_per_unit * oi.qty)::numeric / 3.0, 1)
+          SELECT SUM(pci.qty_per_unit * oi.qty)::int
           FROM product_code_items pci
           JOIN order_items oi ON oi.product_code_id = pci.product_code_id
           JOIN orders o ON o.id = oi.order_id
           WHERE pci.inventory_id = i.id
-            AND o.status <> 'Cancelled'
-            AND o.created_at >= NOW() - INTERVAL '90 days'
+            AND o.status = 'Completed'
+        ), 0)::int AS qty_used,
+        COALESCE((
+          SELECT COALESCE(SUM(pci.qty_per_unit * oi.qty), 0)::float
+          FROM product_code_items pci
+          JOIN order_items oi ON oi.product_code_id = pci.product_code_id
+          JOIN orders o ON o.id = oi.order_id
+          WHERE pci.inventory_id = i.id
+            AND o.status = 'Completed'
+            AND TO_CHAR(COALESCE(o.closed_at, o.created_at), 'YYYY-MM') =
+                TO_CHAR(CURRENT_TIMESTAMP, 'YYYY-MM')
         ), 0)::float AS monthly_avg
       FROM inventory i
       WHERE 1=1`
@@ -1614,7 +2102,8 @@ app.get('/api/inventory', requireRoles(['admin', 'inventory', 'sales']), async (
 
     query += ' ORDER BY i.name ASC'
     const result = await pool.query(query, params)
-    res.json(result.rows.map(mapInventoryRow))
+    const target = await getLowStockTarget()
+    res.json(result.rows.map((row) => mapInventoryRow(row, target)))
   } catch (error) {
     console.error('Error fetching inventory:', error)
     res.status(500).json({ message: 'Server error' })
@@ -1632,7 +2121,8 @@ app.post('/api/inventory', requireRoles(['admin', 'inventory']), async (req, res
     const avail = Number(available) || 0
     const pend = Number(pending) || 0
     const resv = Number(reserved) || 0
-    const itemStatus = status || inventoryStatus(avail, 0)
+    const target = await getLowStockTarget()
+    const itemStatus = status || inventoryStatus(avail, 0, target)
     const base = String(name)
       .toUpperCase()
       .replace(/[^A-Z0-9]+/g, '-')
@@ -1646,7 +2136,7 @@ app.post('/api/inventory', requireRoles(['admin', 'inventory']), async (req, res
       [name.trim(), sku, avail, pend, resv, itemStatus, req.user.id]
     )
 
-    res.status(201).json(mapInventoryRow({ ...result.rows[0], sales_required: 0, monthly_avg: 0 }))
+    res.status(201).json(mapInventoryRow({ ...result.rows[0], sales_required: 0, monthly_avg: 0 }, target))
   } catch (error) {
     console.error('Error creating inventory:', error)
     res.status(500).json({ message: 'Server error' })
@@ -1669,7 +2159,8 @@ app.put('/api/inventory/:id', requireRoles(['admin', 'inventory']), async (req, 
 
     const avail = available != null ? Number(available) : existing.rows[0].available
     const booked = await getBookedQtyForInventory(id)
-    const autoStatus = status || inventoryStatus(avail, booked)
+    const target = await getLowStockTarget()
+    const autoStatus = status || inventoryStatus(avail, booked, target)
 
     const result = await pool.query(
       `UPDATE inventory SET
@@ -1690,7 +2181,7 @@ app.put('/api/inventory/:id', requireRoles(['admin', 'inventory']), async (req, 
       ]
     )
 
-    res.json(mapInventoryRow({ ...result.rows[0], sales_required: booked }))
+    res.json(mapInventoryRow({ ...result.rows[0], sales_required: booked }, target))
   } catch (error) {
     console.error('Error updating inventory:', error)
     res.status(500).json({ message: 'Server error' })
@@ -1713,7 +2204,8 @@ app.post('/api/inventory/:id/adjust', requireRoles(['admin', 'inventory']), asyn
 
     const avail = Number(existing.rows[0].available) + delta
     const booked = await getBookedQtyForInventory(id)
-    const autoStatus = inventoryStatus(avail, booked)
+    const target = await getLowStockTarget()
+    const autoStatus = inventoryStatus(avail, booked, target)
 
     const result = await pool.query(
       `UPDATE inventory SET
@@ -1725,7 +2217,7 @@ app.post('/api/inventory/:id/adjust', requireRoles(['admin', 'inventory']), asyn
       [avail, booked, autoStatus, id]
     )
 
-    res.json(mapInventoryRow({ ...result.rows[0], sales_required: booked }))
+    res.json(mapInventoryRow({ ...result.rows[0], sales_required: booked }, target))
   } catch (error) {
     console.error('Error adjusting inventory:', error)
     res.status(500).json({ message: 'Server error' })
@@ -1799,11 +2291,240 @@ app.get('/api/inventory/:id/bookings', requireRoles(['admin', 'inventory', 'sale
   }
 })
 
-/** Add qty with optional order no + product code; date defaults to today */
+/** Stored monthly used-qty history for one inventory part (resets each calendar month). */
+app.get('/api/inventory/:id/monthly-stats', requireRoles(['admin', 'inventory', 'sales']), async (req, res) => {
+  const { id } = req.params
+  try {
+    const inv = await pool.query('SELECT id, name FROM inventory WHERE id = $1', [id])
+    if (inv.rows.length === 0) {
+      return res.status(404).json({ message: 'Item not found' })
+    }
+    await syncInventoryMonthlyStats(Number(id))
+    const months = await getStoredMonthlyStats('inventory', Number(id))
+    const thisMonth = currentYearMonth()
+    res.json({
+      inventory: inv.rows[0],
+      metric: 'used',
+      current_month: thisMonth,
+      current_label: formatYearMonthLabel(thisMonth),
+      monthly_avg: months.find((m) => m.is_current)?.qty ?? 0,
+      months,
+    })
+  } catch (error) {
+    console.error('Error fetching inventory monthly stats:', error)
+    res.status(500).json({ message: 'Server error' })
+  }
+})
+
+/** Full inventory summary: stats, per-company, monthly, history */
+app.get('/api/inventory/:id/summary', requireRoles(['admin', 'inventory', 'sales']), async (req, res) => {
+  const { id } = req.params
+  try {
+    const invRes = await pool.query(
+      `SELECT id, name, sku, available, pending, reserved, status
+       FROM inventory WHERE id = $1`,
+      [id]
+    )
+    if (invRes.rows.length === 0) {
+      return res.status(404).json({ message: 'Item not found' })
+    }
+
+    const inventoryId = Number(id)
+    await syncInventoryMonthlyStats(inventoryId)
+    const months = await getStoredMonthlyStats('inventory', inventoryId)
+    const booked = await getBookedQtyForInventory(inventoryId)
+    const target = await getLowStockTarget()
+
+    const now = new Date()
+    const fy = getFinancialYear(now)
+    const thisYm = currentYearMonth()
+    const fyStart = new Date(fy.startYear, 3, 1)
+    const fyEnd = new Date(fy.endYear, 2, 31, 23, 59, 59)
+
+    const usageRes = await pool.query(
+      `SELECT
+         o.id AS order_id,
+         o.company,
+         o.order_no,
+         o.status,
+         oi.product_code,
+         oi.product_name,
+         (pci.qty_per_unit * oi.qty)::int AS qty,
+         COALESCE(o.closed_at, o.created_at) AS event_at,
+         COALESCE(o.date, TO_CHAR(o.created_at, 'DD Mon YYYY')) AS date,
+         o.created_at
+       FROM product_code_items pci
+       JOIN order_items oi ON oi.product_code_id = pci.product_code_id
+       JOIN orders o ON o.id = oi.order_id
+       WHERE pci.inventory_id = $1
+         AND o.status <> 'Cancelled'
+       ORDER BY COALESCE(o.closed_at, o.created_at) DESC`,
+      [inventoryId]
+    )
+
+    const movesRes = await pool.query(
+      `SELECT
+         COALESCE(order_no, 'Inward') AS order_no,
+         COALESCE(product_code, '') AS product_code,
+         qty::int AS qty,
+         movement_date AS date,
+         'Added' AS status,
+         'manual' AS source,
+         created_at
+       FROM inventory_movements
+       WHERE inventory_id = $1
+       ORDER BY created_at DESC
+       LIMIT 100`,
+      [inventoryId]
+    )
+
+    const linkedProducts = await pool.query(
+      `SELECT pc.id, pc.code, pc.name, pci.qty_per_unit
+       FROM product_code_items pci
+       JOIN product_codes pc ON pc.id = pci.product_code_id
+       WHERE pci.inventory_id = $1
+       ORDER BY pc.code`,
+      [inventoryId]
+    )
+
+    const eventDate = (row) => {
+      const d = new Date(row.event_at || row.created_at)
+      return Number.isNaN(d.getTime()) ? new Date() : d
+    }
+    const ymKey = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`
+    const inFy = (d) => d >= fyStart && d <= fyEnd
+
+    const lines = usageRes.rows
+    const completed = lines.filter((r) => r.status === 'Completed')
+    const pending = lines.filter((r) => r.status === 'Pending')
+
+    const usedQty = completed.reduce((s, r) => s + (Number(r.qty) || 0), 0)
+    const pendingQty = pending.reduce((s, r) => s + (Number(r.qty) || 0), 0)
+    const fyUsed = completed.filter((r) => inFy(eventDate(r))).reduce((s, r) => s + (Number(r.qty) || 0), 0)
+    const thisMonthUsed = completed
+      .filter((r) => ymKey(eventDate(r)) === thisYm)
+      .reduce((s, r) => s + (Number(r.qty) || 0), 0)
+    const monthKeys = new Set(completed.map((r) => ymKey(eventDate(r))))
+    const monthsActive = Math.max(1, monthKeys.size || 1)
+    const monthlyAvgQty = Math.round((usedQty / monthsActive) * 10) / 10
+    const customers = new Set(lines.map((r) => String(r.company || '').trim().toLowerCase()).filter(Boolean))
+    const inwardQty = movesRes.rows
+      .filter((m) => Number(m.qty) > 0)
+      .reduce((s, m) => s + (Number(m.qty) || 0), 0)
+
+    const companyMap = new Map()
+    for (const r of lines) {
+      const name = r.company || '—'
+      const key = name.toLowerCase()
+      const row = companyMap.get(key) || {
+        company: name,
+        orderIds: new Set(),
+        pending_qty: 0,
+        used_qty: 0,
+        fy_qty: 0,
+        this_month_qty: 0,
+        monthKeys: new Set(),
+        products: new Set(),
+      }
+      row.orderIds.add(r.order_id)
+      const qty = Number(r.qty) || 0
+      const d = eventDate(r)
+      if (r.product_code) row.products.add(r.product_code)
+      if (r.status === 'Pending') row.pending_qty += qty
+      if (r.status === 'Completed') {
+        row.used_qty += qty
+        row.monthKeys.add(ymKey(d))
+        if (inFy(d)) row.fy_qty += qty
+        if (ymKey(d) === thisYm) row.this_month_qty += qty
+      }
+      companyMap.set(key, row)
+    }
+
+    const companies = [...companyMap.values()]
+      .map((row) => {
+        const active = Math.max(1, row.monthKeys.size || 1)
+        return {
+          company: row.company,
+          orders_count: row.orderIds.size,
+          products_count: row.products.size,
+          pending_qty: row.pending_qty,
+          used_qty: row.used_qty,
+          monthly_avg_qty: Math.round((row.used_qty / active) * 10) / 10,
+          fy_qty: row.fy_qty,
+          lifetime_qty: row.used_qty,
+          this_month_qty: row.this_month_qty,
+        }
+      })
+      .sort((a, b) => b.used_qty - a.used_qty || a.company.localeCompare(b.company))
+
+    const history = [
+      ...movesRes.rows.map((m) => ({
+        kind: Number(m.qty) >= 0 ? 'inward' : 'stock',
+        company: Number(m.qty) >= 0 ? 'Inward / Stock' : 'Stock move',
+        order_no: m.order_no || '—',
+        product_code: m.product_code || '—',
+        qty: Number(m.qty) || 0,
+        date: m.date || '—',
+        status: m.status || 'Added',
+        sortAt: m.created_at ? new Date(m.created_at).getTime() : 0,
+      })),
+      ...lines.map((r) => ({
+        kind: 'order',
+        company: r.company || '—',
+        order_no: r.order_no || '—',
+        product_code: r.product_code || '—',
+        qty: Number(r.qty) || 0,
+        date: r.date || '—',
+        status: r.status || '—',
+        sortAt: r.created_at ? new Date(r.created_at).getTime() : 0,
+      })),
+    ].sort((a, b) => b.sortAt - a.sortAt)
+
+    const row = invRes.rows[0]
+    res.json({
+      inventory: {
+        ...row,
+        available: Number(row.available) || 0,
+        required_qty: booked,
+        status: inventoryStatus(Number(row.available) || 0, booked, target),
+      },
+      stats: {
+        available: Number(row.available) || 0,
+        required_qty: booked,
+        pending_qty: pendingQty,
+        used_qty: usedQty,
+        customers_count: customers.size,
+        orders_count: new Set(lines.map((r) => r.order_id)).size,
+        this_month_qty: thisMonthUsed,
+        monthly_avg_qty: monthlyAvgQty,
+        fy_label: `FY ${fy.label}`,
+        fy_qty: fyUsed,
+        lifetime_qty: usedQty,
+        inward_qty: inwardQty,
+        months_active: monthsActive,
+      },
+      companies,
+      products: linkedProducts.rows.map((p) => ({
+        id: p.id,
+        code: p.code,
+        name: p.name,
+        qty_per_unit: Number(p.qty_per_unit) || 1,
+      })),
+      months,
+      history,
+    })
+  } catch (error) {
+    console.error('Error fetching inventory summary:', error)
+    res.status(500).json({ message: 'Server error' })
+  }
+})
+
+/** Add qty (inward stock). Defaults label to Inward. */
 app.post('/api/inventory/:id/add-qty', requireRoles(['admin', 'inventory']), async (req, res) => {
   const { id } = req.params
   const qty = Number(req.body?.qty)
-  const orderNo = String(req.body?.order_no || '').trim()
+  const orderNo =
+    String(req.body?.inward || req.body?.order_no || 'Inward').trim() || 'Inward'
   const productCode = String(req.body?.product_code || '').trim()
   const date =
     String(req.body?.date || '').trim() ||
@@ -1824,7 +2545,8 @@ app.post('/api/inventory/:id/add-qty', requireRoles(['admin', 'inventory']), asy
 
     const avail = Number(existing.rows[0].available) + qty
     const booked = await getBookedQtyForInventory(id, client)
-    const autoStatus = inventoryStatus(avail, booked)
+    const target = await getLowStockTarget(client)
+    const autoStatus = inventoryStatus(avail, booked, target)
 
     const result = await client.query(
       `UPDATE inventory SET
@@ -1843,7 +2565,7 @@ app.post('/api/inventory/:id/add-qty', requireRoles(['admin', 'inventory']), asy
     )
 
     await client.query('COMMIT')
-    res.json(mapInventoryRow({ ...result.rows[0], sales_required: booked }))
+    res.json(mapInventoryRow({ ...result.rows[0], sales_required: booked }, target))
   } catch (error) {
     await client.query('ROLLBACK')
     console.error('Error adding inventory qty:', error)
@@ -1859,8 +2581,10 @@ app.post('/api/inventory/import', requireRoles(['admin', 'inventory']), async (r
   if (!rows?.length) return res.status(400).json({ message: 'No rows to import.' })
 
   let imported = 0
+  let updated = 0
   let skipped = 0
   const errors = []
+  const target = await getLowStockTarget()
 
   const makeSku = (name, index) => {
     const base = String(name)
@@ -1884,28 +2608,69 @@ app.post('/api/inventory/import', requireRoles(['admin', 'inventory']), async (r
         continue
       }
 
-      const existing = await pool.query('SELECT id FROM inventory WHERE LOWER(name) = LOWER($1) LIMIT 1', [name])
+      const existing = await pool.query('SELECT id, available FROM inventory WHERE LOWER(name) = LOWER($1) LIMIT 1', [
+        name,
+      ])
+
+      const availFromRow = Number(row.available ?? row.qty ?? row.Quantity)
+      const hasQty = !namesOnly && Number.isFinite(availFromRow)
+
       if (existing.rows[0]) {
-        skipped++
+        if (hasQty) {
+          const avail = availFromRow
+          const booked = await getBookedQtyForInventory(existing.rows[0].id)
+          const status = inventoryStatus(avail, booked, target)
+          await pool.query(
+            `UPDATE inventory SET available = $1, pending = $2, status = $3, updated_at = CURRENT_TIMESTAMP WHERE id = $4`,
+            [avail, booked, status, existing.rows[0].id]
+          )
+          updated++
+        } else {
+          skipped++
+        }
         continue
       }
 
-      // Only Particulars: do not import Quantity / Rate / Value unless explicitly provided and not namesOnly
-      const avail = namesOnly ? 0 : Number(row.available ?? row.qty ?? row.Quantity) || 0
+      const avail = hasQty ? availFromRow : 0
       const sku = String(row.sku || row.SKU || '').trim() || makeSku(name, i + 1)
-      const required = namesOnly ? 0 : Number(row.required_qty) || 0
-      const status = avail <= 0 ? 'Defect' : avail <= 20 ? 'Low Stock' : 'Normal'
+      const status = inventoryStatus(avail, 0, target)
 
       await pool.query(
         'INSERT INTO inventory (name, sku, available, pending, reserved, required_qty, status, created_by) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)',
-        [name, sku, avail, 0, 0, required, status, req.user.id]
+        [name, sku, avail, 0, 0, 0, status, req.user.id]
       )
       imported++
     } catch (e) {
       errors.push(`Row ${i + 1}: ${e.message}`)
     }
   }
-  res.json({ imported, skipped, total: rows.length, errors })
+  res.json({ imported, updated, skipped, total: rows.length, errors })
+})
+
+/** Remove inventory rows that are actually product names (StkSum wrongly imported into inventory). Keeps BOM-linked parts. */
+app.post('/api/inventory/cleanup-products', requireRoles(['admin', 'inventory']), async (req, res) => {
+  try {
+    const result = await pool.query(`
+      DELETE FROM inventory i
+      WHERE EXISTS (
+        SELECT 1 FROM product_codes pc
+        WHERE LOWER(TRIM(pc.name)) = LOWER(TRIM(i.name))
+           OR LOWER(TRIM(COALESCE(pc.description, ''))) = LOWER(TRIM(i.name))
+           OR LOWER(TRIM(pc.code)) = LOWER(TRIM(i.name))
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM product_code_items pci WHERE pci.inventory_id = i.id
+      )
+      RETURNING i.id, i.name
+    `)
+    res.json({
+      deleted: result.rowCount || 0,
+      names: result.rows.map((r) => r.name).slice(0, 50),
+    })
+  } catch (error) {
+    console.error('Inventory cleanup error:', error)
+    res.status(500).json({ message: 'Server error' })
+  }
 })
 
 app.post('/api/customers/import', requireRoles(['admin', 'sales']), async (req, res) => {
@@ -1913,30 +2678,62 @@ app.post('/api/customers/import', requireRoles(['admin', 'sales']), async (req, 
   if (!rows?.length) return res.status(400).json({ message: 'No rows to import.' })
 
   let imported = 0
+  let updated = 0
+  let skipped = 0
   const errors = []
+
   for (let i = 0; i < rows.length; i++) {
     const row = rows[i]
     try {
-      const name = row.name
-      const email = row.email
-      const phone = row.phone
-      const city = row.city
-      const state = row.state
-      if (!name || !email || !phone || !city || !state) {
-        errors.push(`Row ${i + 1}: name, email, phone, city, state required`)
+      const name = String(
+        row.name || row['Company name'] || row['Company Name'] || row.Name || ''
+      ).trim()
+      if (!name) {
+        errors.push(`Row ${i + 1}: Company name required`)
         continue
       }
-      await pool.query(
-        `INSERT INTO customers (name, email, phone, city, state, orders_count, total_amount, gst_no, address, created_by)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
-        [name, email, phone, city, state, Number(row.orders) || 0, row.total_amount || '₹ 0', row.gst_no || '', row.address || '', req.user.id]
+
+      const address = String(row.address || row.Address || '').trim()
+      const state = String(row.state || row.State || '—').trim() || '—'
+      const city = String(row.city || row.City || state || '—').trim() || '—'
+      const gst = String(row.gst_no || row['GSTIN/UIN'] || row.GSTIN || row.GST || '').trim()
+      const email =
+        String(row.email || row.Email || '').trim() ||
+        `${name.toLowerCase().replace(/[^a-z0-9]+/g, '.').slice(0, 40)}@import.local`
+      const phone = String(row.phone || row.Phone || '—').trim() || '—'
+
+      const existing = await pool.query(
+        'SELECT id FROM customers WHERE LOWER(name) = LOWER($1) LIMIT 1',
+        [name]
       )
-      imported++
+
+      if (existing.rows[0]) {
+        await pool.query(
+          `UPDATE customers SET
+            email = COALESCE(NULLIF($1, ''), email),
+            phone = COALESCE(NULLIF($2, ''), phone),
+            city = COALESCE(NULLIF($3, ''), city),
+            state = COALESCE(NULLIF($4, ''), state),
+            gst_no = COALESCE(NULLIF($5, ''), gst_no),
+            address = COALESCE(NULLIF($6, ''), address),
+            updated_at = CURRENT_TIMESTAMP
+           WHERE id = $7`,
+          [email, phone, city, state, gst, address, existing.rows[0].id]
+        )
+        updated++
+      } else {
+        await pool.query(
+          `INSERT INTO customers (name, email, phone, city, state, orders_count, total_amount, gst_no, address, created_by)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+          [name, email, phone, city, state, 0, '₹ 0', gst, address, req.user.id]
+        )
+        imported++
+      }
     } catch (e) {
       errors.push(`Row ${i + 1}: ${e.message}`)
     }
   }
-  res.json({ imported, total: rows.length, errors })
+  res.json({ imported, updated, skipped, total: rows.length, errors })
 })
 
 app.post('/api/products/import', requireRoles(['admin']), async (req, res) => {
@@ -1994,6 +2791,62 @@ app.post('/api/products/import', requireRoles(['admin']), async (req, res) => {
   res.json({ imported, skipped, total: rows.length, errors })
 })
 
+/** Import StkSum / product names into product_codes (Particulars → product code + name) */
+app.post('/api/product-codes/import', requireRoles(['admin', 'inventory']), async (req, res) => {
+  const { rows } = req.body
+  if (!rows?.length) return res.status(400).json({ message: 'No rows to import.' })
+
+  let imported = 0
+  let skipped = 0
+  const errors = []
+
+  const makeCode = (name, index) => {
+    const base = String(name)
+      .toUpperCase()
+      .replace(/[^A-Z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '')
+      .slice(0, 20)
+    return `${base || 'PRD'}-${String(index).padStart(3, '0')}`
+  }
+
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i]
+    try {
+      const name = String(row.Particulars || row.particulars || row.name || row.Name || '').trim()
+      if (!name || /^\d+$/.test(name) || /^grand total$/i.test(name)) {
+        skipped++
+        continue
+      }
+
+      const existing = await pool.query(
+        'SELECT id FROM product_codes WHERE LOWER(name) = LOWER($1) OR LOWER(code) = LOWER($2) LIMIT 1',
+        [name, row.code || '']
+      )
+      if (existing.rows[0]) {
+        skipped++
+        continue
+      }
+
+      const code = String(row.code || '').trim().toUpperCase() || makeCode(name, i + 1)
+      const categoryName = String(row.category || row.Category || name).trim() || name
+
+      await pool.query(
+        `INSERT INTO product_codes (code, name, description, created_by)
+         VALUES ($1, $2, $3, $4)`,
+        [code, categoryName, name, req.user.id]
+      )
+      imported++
+    } catch (e) {
+      if (e.code === '23505') {
+        skipped++
+        continue
+      }
+      errors.push(`Row ${i + 1}: ${e.message}`)
+    }
+  }
+  res.json({ imported, skipped, total: rows.length, errors })
+})
+
 app.post('/api/orders/import', requireRoles(['admin', 'sales']), async (req, res) => {
   const { rows } = req.body
   if (!rows?.length) return res.status(400).json({ message: 'No rows to import.' })
@@ -2031,37 +2884,532 @@ app.post('/api/orders/import', requireRoles(['admin', 'sales']), async (req, res
 app.get('/api/product-codes', requireRoles(['admin', 'inventory', 'sales']), async (req, res) => {
   try {
     const codes = await pool.query('SELECT * FROM product_codes ORDER BY code ASC')
-    const withItems = await Promise.all(
-      codes.rows.map(async (code) => {
-        const items = await getProductCodeItems(code.id)
-        const bookedRes = await pool.query(
-          `SELECT COALESCE(SUM(oi.qty), 0)::int AS booked
-           FROM order_items oi
-           JOIN orders o ON o.id = oi.order_id
-           WHERE oi.product_code_id = $1 AND o.status = 'Pending'`,
-          [code.id]
-        )
-        const qtyAvailable =
-          items.length === 0
-            ? null
-            : Math.min(
-                ...items.map((item) => {
-                  const per = Number(item.qty_per_unit) || 1
-                  return Math.floor((Number(item.available) || 0) / per)
-                })
-              )
-        return {
-          ...code,
-          items,
-          qty_available: qtyAvailable,
-          booked: Number(bookedRes.rows[0]?.booked) || 0,
-        }
-      })
+    if (codes.rows.length === 0) {
+      return res.json([])
+    }
+
+    // Batch: all BOM items + inventory booked (one query, not per product)
+    const itemsRes = await pool.query(
+      `SELECT pci.product_code_id, pci.id, pci.qty_per_unit,
+              i.id AS inventory_id, i.name, i.sku,
+              i.available, i.pending, i.reserved, i.required_qty, i.status,
+              COALESCE((
+                SELECT SUM(pci2.qty_per_unit * oi.qty)::int
+                FROM product_code_items pci2
+                JOIN order_items oi ON oi.product_code_id = pci2.product_code_id
+                JOIN orders o ON o.id = oi.order_id
+                WHERE pci2.inventory_id = i.id AND o.status = 'Pending'
+              ), 0)::int AS booked
+       FROM product_code_items pci
+       JOIN inventory i ON i.id = pci.inventory_id
+       ORDER BY i.name`
     )
+
+    // Batch: booked / sold / monthly avg per product
+    const statsRes = await pool.query(
+      `SELECT
+         oi.product_code_id,
+         COALESCE(SUM(oi.qty) FILTER (WHERE o.status = 'Pending'), 0)::int AS booked,
+         COALESCE(SUM(oi.qty) FILTER (WHERE o.status = 'Completed'), 0)::int AS sold,
+         COALESCE(
+           SUM(oi.qty) FILTER (
+             WHERE o.status = 'Completed'
+               AND TO_CHAR(COALESCE(o.closed_at, o.created_at), 'YYYY-MM') =
+                   TO_CHAR(CURRENT_TIMESTAMP, 'YYYY-MM')
+           ),
+           0
+         )::float AS monthly_avg
+       FROM order_items oi
+       JOIN orders o ON o.id = oi.order_id
+       WHERE oi.product_code_id IS NOT NULL
+       GROUP BY oi.product_code_id`
+    )
+
+    const itemsByCode = new Map()
+    for (const row of itemsRes.rows) {
+      const list = itemsByCode.get(row.product_code_id) || []
+      const booked = Number(row.booked) || 0
+      list.push({
+        ...row,
+        available: Number(row.available) || 0,
+        booked,
+        pending: booked,
+        required_qty: booked,
+      })
+      itemsByCode.set(row.product_code_id, list)
+    }
+
+    const statsByCode = new Map()
+    for (const row of statsRes.rows) {
+      statsByCode.set(row.product_code_id, {
+        booked: Number(row.booked) || 0,
+        sold: Number(row.sold) || 0,
+        monthly_avg: Number(row.monthly_avg) || 0,
+      })
+    }
+
+    const withItems = codes.rows.map((code) => {
+      const items = itemsByCode.get(code.id) || []
+      const stats = statsByCode.get(code.id) || { booked: 0, sold: 0, monthly_avg: 0 }
+      const stockQty = Math.max(0, Number(code.stock_qty) || 0)
+      return {
+        ...code,
+        stock_qty: stockQty,
+        items,
+        qty_available: stockQty,
+        booked: stats.booked,
+        required_qty: stats.booked,
+        sold: stats.sold,
+        monthly_avg: stats.monthly_avg,
+      }
+    })
+
     res.json(withItems)
   } catch (error) {
     console.error('Error fetching product codes:', error)
     res.status(500).json({ message: 'Server error' })
+  }
+})
+
+app.get('/api/product-codes/:id/bookings', requireRoles(['admin', 'inventory', 'sales']), async (req, res) => {
+  const { id } = req.params
+  try {
+    const codeRes = await pool.query('SELECT id, code, name FROM product_codes WHERE id = $1', [id])
+    if (codeRes.rows.length === 0) {
+      return res.status(404).json({ message: 'Product code not found.' })
+    }
+
+    const sales = await pool.query(
+      `SELECT
+         o.company,
+         o.order_no,
+         oi.qty::int AS qty,
+         COALESCE(o.date, TO_CHAR(o.created_at, 'DD Mon YYYY')) AS date,
+         o.status,
+         o.created_at
+       FROM order_items oi
+       JOIN orders o ON o.id = oi.order_id
+       WHERE oi.product_code_id = $1
+         AND o.status <> 'Cancelled'
+       ORDER BY o.created_at DESC
+       LIMIT 100`,
+      [id]
+    )
+
+    const stockAdds = await pool.query(
+      `SELECT
+         label,
+         qty::int AS qty,
+         stock_after::int AS stock_after,
+         movement_date AS date,
+         note,
+         created_at
+       FROM product_stock_movements
+       WHERE product_code_id = $1
+       ORDER BY created_at DESC
+       LIMIT 100`,
+      [id]
+    )
+
+    res.json({
+      product: codeRes.rows[0],
+      bookings: sales.rows.map((b) => ({
+        type: 'order',
+        company: b.company || '—',
+        order_no: b.order_no || '—',
+        qty: Number(b.qty) || 0,
+        date: b.date || '—',
+        status: b.status,
+        created_at: b.created_at,
+      })),
+      stock_history: stockAdds.rows.map((m) => ({
+        type: 'stock',
+        label: m.label || 'Stock',
+        qty: Number(m.qty) || 0,
+        stock_after: Number(m.stock_after) || 0,
+        date: m.date || '—',
+        note: m.note || '',
+        created_at: m.created_at,
+      })),
+    })
+  } catch (error) {
+    console.error('Error fetching product bookings:', error)
+    res.status(500).json({ message: 'Server error' })
+  }
+})
+
+/** Full product summary page: stats, per-company, monthly, history */
+app.get('/api/product-codes/:id/summary', requireRoles(['admin', 'inventory', 'sales']), async (req, res) => {
+  const { id } = req.params
+  try {
+    const codeRes = await pool.query(
+      `SELECT id, code, name, description, COALESCE(stock_qty, 0)::int AS stock_qty
+       FROM product_codes WHERE id = $1`,
+      [id]
+    )
+    if (codeRes.rows.length === 0) {
+      return res.status(404).json({ message: 'Product code not found.' })
+    }
+
+    const productId = Number(id)
+    const items = await getProductCodeItems(productId)
+    await syncProductMonthlyStats(productId)
+    const months = await getStoredMonthlyStats('product', productId)
+
+    const now = new Date()
+    const fy = getFinancialYear(now)
+    const fyStart = `${fy.startYear}-04-01`
+    const fyEnd = `${fy.endYear}-03-31`
+    const thisYm = currentYearMonth()
+
+    const linesRes = await pool.query(
+      `SELECT
+         o.id AS order_id,
+         o.company,
+         o.order_no,
+         o.status,
+         oi.qty::int AS qty,
+         oi.amount,
+         COALESCE(o.closed_at, o.created_at) AS event_at,
+         COALESCE(o.date, TO_CHAR(o.created_at, 'DD Mon YYYY')) AS date,
+         o.created_at
+       FROM order_items oi
+       JOIN orders o ON o.id = oi.order_id
+       WHERE oi.product_code_id = $1
+         AND o.status <> 'Cancelled'
+       ORDER BY COALESCE(o.closed_at, o.created_at) DESC`,
+      [productId]
+    )
+
+    const stockAdds = await pool.query(
+      `SELECT label, qty::int AS qty, stock_after::int AS stock_after, movement_date AS date, created_at
+       FROM product_stock_movements
+       WHERE product_code_id = $1
+       ORDER BY created_at DESC
+       LIMIT 100`,
+      [productId]
+    )
+
+    const parseAmt = (v) => parseAmount(v)
+    const eventDate = (row) => {
+      const d = new Date(row.event_at || row.created_at)
+      return Number.isNaN(d.getTime()) ? new Date() : d
+    }
+    const inFy = (d) => {
+      const a = new Date(fy.startYear, 3, 1)
+      const b = new Date(fy.endYear, 2, 31, 23, 59, 59)
+      return d >= a && d <= b
+    }
+    const ymKey = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`
+
+    const lines = linesRes.rows
+    const completed = lines.filter((r) => r.status === 'Completed')
+    const pending = lines.filter((r) => r.status === 'Pending')
+
+    const soldQty = completed.reduce((s, r) => s + (Number(r.qty) || 0), 0)
+    const pendingQty = pending.reduce((s, r) => s + (Number(r.qty) || 0), 0)
+    const lifetimeRevenue = completed.reduce((s, r) => s + parseAmt(r.amount), 0)
+    const fyCompleted = completed.filter((r) => inFy(eventDate(r)))
+    const fyQty = fyCompleted.reduce((s, r) => s + (Number(r.qty) || 0), 0)
+    const fyRevenue = fyCompleted.reduce((s, r) => s + parseAmt(r.amount), 0)
+    const thisMonthCompleted = completed.filter((r) => ymKey(eventDate(r)) === thisYm)
+    const thisMonthQty = thisMonthCompleted.reduce((s, r) => s + (Number(r.qty) || 0), 0)
+    const thisMonthRevenue = thisMonthCompleted.reduce((s, r) => s + parseAmt(r.amount), 0)
+
+    const monthKeys = new Set(completed.map((r) => ymKey(eventDate(r))))
+    const monthsActive = Math.max(1, monthKeys.size || 1)
+    const monthlyAvgQty = Math.round((soldQty / monthsActive) * 10) / 10
+    const monthlyAvgRevenue = Math.round(lifetimeRevenue / monthsActive)
+    const customers = new Set(lines.map((r) => String(r.company || '').trim().toLowerCase()).filter(Boolean))
+
+    // Per-company rollup
+    const companyMap = new Map()
+    for (const r of lines) {
+      const name = r.company || '—'
+      const key = name.toLowerCase()
+      const row = companyMap.get(key) || {
+        company: name,
+        orders_count: 0,
+        orderIds: new Set(),
+        pending_qty: 0,
+        sold_qty: 0,
+        lifetime_revenue: 0,
+        fy_qty: 0,
+        fy_revenue: 0,
+        this_month_qty: 0,
+        monthKeys: new Set(),
+      }
+      row.orderIds.add(r.order_id)
+      const qty = Number(r.qty) || 0
+      const amt = parseAmt(r.amount)
+      const d = eventDate(r)
+      if (r.status === 'Pending') row.pending_qty += qty
+      if (r.status === 'Completed') {
+        row.sold_qty += qty
+        row.lifetime_revenue += amt
+        row.monthKeys.add(ymKey(d))
+        if (inFy(d)) {
+          row.fy_qty += qty
+          row.fy_revenue += amt
+        }
+        if (ymKey(d) === thisYm) row.this_month_qty += qty
+      }
+      companyMap.set(key, row)
+    }
+
+    const companies = [...companyMap.values()]
+      .map((row) => {
+        const active = Math.max(1, row.monthKeys.size || 1)
+        return {
+          company: row.company,
+          orders_count: row.orderIds.size,
+          pending_qty: row.pending_qty,
+          sold_qty: row.sold_qty,
+          monthly_avg_qty: Math.round((row.sold_qty / active) * 10) / 10,
+          monthly_avg_revenue: Math.round(row.lifetime_revenue / active),
+          monthly_avg_revenue_label: formatRupee(Math.round(row.lifetime_revenue / active)),
+          fy_qty: row.fy_qty,
+          fy_revenue: row.fy_revenue,
+          fy_revenue_label: formatRupee(row.fy_revenue),
+          lifetime_revenue: row.lifetime_revenue,
+          lifetime_revenue_label: formatRupee(row.lifetime_revenue),
+          this_month_qty: row.this_month_qty,
+        }
+      })
+      .sort((a, b) => b.lifetime_revenue - a.lifetime_revenue || a.company.localeCompare(b.company))
+
+    const history = [
+      ...stockAdds.rows.map((m) => ({
+        kind: 'stock',
+        company: m.label || 'Stock',
+        order_no: '—',
+        qty: Number(m.qty) || 0,
+        amount_label: '—',
+        date: m.date || '—',
+        status: 'Add in stock',
+        sortAt: m.created_at ? new Date(m.created_at).getTime() : 0,
+      })),
+      ...lines.map((r) => ({
+        kind: 'order',
+        company: r.company || '—',
+        order_no: r.order_no || '—',
+        qty: Number(r.qty) || 0,
+        amount_label: formatRupee(parseAmt(r.amount)),
+        date: r.date || '—',
+        status: r.status || '—',
+        sortAt: r.created_at ? new Date(r.created_at).getTime() : 0,
+      })),
+    ].sort((a, b) => b.sortAt - a.sortAt)
+
+    res.json({
+      product: {
+        ...codeRes.rows[0],
+        stock_qty: Math.max(0, Number(codeRes.rows[0].stock_qty) || 0),
+        items,
+      },
+      stats: {
+        available: Math.max(0, Number(codeRes.rows[0].stock_qty) || 0),
+        pending_qty: pendingQty,
+        sold_qty: soldQty,
+        customers_count: customers.size,
+        orders_count: new Set(lines.map((r) => r.order_id)).size,
+        this_month_qty: thisMonthQty,
+        this_month_revenue: formatRupee(thisMonthRevenue),
+        monthly_avg_qty: monthlyAvgQty,
+        monthly_avg_revenue: formatRupee(monthlyAvgRevenue),
+        fy_label: `FY ${fy.label}`,
+        fy_qty: fyQty,
+        fy_revenue: formatRupee(fyRevenue),
+        lifetime_qty: soldQty,
+        lifetime_revenue: formatRupee(lifetimeRevenue),
+        months_active: monthsActive,
+      },
+      companies,
+      months,
+      history,
+    })
+  } catch (error) {
+    console.error('Error fetching product summary:', error)
+    res.status(500).json({ message: 'Server error' })
+  }
+})
+
+/** Stored monthly sold-qty history for one product (resets each calendar month). */
+app.get('/api/product-codes/:id/monthly-stats', requireRoles(['admin', 'inventory', 'sales']), async (req, res) => {
+  const { id } = req.params
+  try {
+    const codeRes = await pool.query('SELECT id, code, name FROM product_codes WHERE id = $1', [id])
+    if (codeRes.rows.length === 0) {
+      return res.status(404).json({ message: 'Product code not found.' })
+    }
+    await syncProductMonthlyStats(Number(id))
+    const months = await getStoredMonthlyStats('product', Number(id))
+    const thisMonth = currentYearMonth()
+    res.json({
+      product: codeRes.rows[0],
+      metric: 'sold',
+      current_month: thisMonth,
+      current_label: formatYearMonthLabel(thisMonth),
+      monthly_avg: months.find((m) => m.is_current)?.qty ?? 0,
+      months,
+    })
+  } catch (error) {
+    console.error('Error fetching product monthly stats:', error)
+    res.status(500).json({ message: 'Server error' })
+  }
+})
+
+/** Add product stock (+ qty available) and deduct ALL linked inventory parts. */
+app.post('/api/product-codes/:id/add-qty', requireRoles(['admin', 'inventory']), async (req, res) => {
+  const { id } = req.params
+  const qty = Number(req.body?.qty)
+  const orderNo = String(req.body?.stock || req.body?.order_no || 'Stock').trim() || 'Stock'
+  const date =
+    String(req.body?.date || '').trim() ||
+    new Date().toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' })
+  const note = String(req.body?.note || '').trim() || 'Product stock added'
+
+  if (!Number.isFinite(qty) || qty <= 0) {
+    return res.status(400).json({ message: 'Enter a product qty greater than 0.' })
+  }
+
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    const codeRes = await client.query('SELECT * FROM product_codes WHERE id = $1 FOR UPDATE', [id])
+    if (codeRes.rows.length === 0) {
+      await client.query('ROLLBACK')
+      return res.status(404).json({ message: 'Product code not found.' })
+    }
+
+    const items = await getProductCodeItems(Number(id), client)
+    if (items.length === 0) {
+      await client.query('ROLLBACK')
+      return res.status(400).json({ message: 'Link inventory parts before adding product qty.' })
+    }
+
+    // + product stock
+    const before = Math.max(0, Number(codeRes.rows[0].stock_qty) || 0)
+    const newStock = before + qty
+    const updated = await client.query(
+      `UPDATE product_codes
+       SET stock_qty = $1, updated_at = CURRENT_TIMESTAMP
+       WHERE id = $2
+       RETURNING *`,
+      [newStock, id]
+    )
+
+    await client.query(
+      `INSERT INTO product_stock_movements
+         (product_code_id, label, qty, stock_after, movement_date, note, created_by)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [id, orderNo, qty, newStock, date, note, req.user.id]
+    )
+
+    // − every linked inventory part (merge duplicate links)
+    const bomByInventory = new Map()
+    for (const item of items) {
+      const invId = Number(item.inventory_id)
+      const per = Number(item.qty_per_unit) || 1
+      const prev = bomByInventory.get(invId)
+      if (prev) {
+        prev.qty_per_unit += per
+      } else {
+        bomByInventory.set(invId, {
+          inventory_id: invId,
+          name: item.name,
+          qty_per_unit: per,
+        })
+      }
+    }
+
+    const deductions = []
+    const target = await getLowStockTarget(client)
+    for (const item of bomByInventory.values()) {
+      const deduct = item.qty_per_unit * qty
+      const inv = await client.query('SELECT * FROM inventory WHERE id = $1 FOR UPDATE', [item.inventory_id])
+      if (inv.rows.length === 0) {
+        await client.query('ROLLBACK')
+        return res.status(400).json({ message: `Inventory part missing: ${item.name}` })
+      }
+      const invBefore = Number(inv.rows[0].available) || 0
+      const newAvail = invBefore - deduct
+      const booked = await getBookedQtyForInventory(item.inventory_id, client)
+      const autoStatus = inventoryStatus(newAvail, booked, target)
+      await client.query(
+        `UPDATE inventory SET
+          available = $1,
+          pending = $2,
+          status = $3,
+          updated_at = CURRENT_TIMESTAMP
+         WHERE id = $4`,
+        [newAvail, booked, autoStatus, item.inventory_id]
+      )
+      await client.query(
+        `INSERT INTO inventory_movements (inventory_id, order_no, product_code, qty, movement_date, note, created_by)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+        [item.inventory_id, orderNo, codeRes.rows[0].code, -deduct, date, note, req.user.id]
+      )
+      deductions.push({
+        inventory_id: item.inventory_id,
+        name: item.name || inv.rows[0].name,
+        qty_per_unit: item.qty_per_unit,
+        deducted: deduct,
+        available_before: invBefore,
+        available: newAvail,
+      })
+    }
+
+    await client.query('COMMIT')
+
+    const refreshedItems = await getProductCodeItems(Number(id))
+    const bookedRes = await pool.query(
+      `SELECT COALESCE(SUM(oi.qty), 0)::int AS booked
+       FROM order_items oi
+       JOIN orders o ON o.id = oi.order_id
+       WHERE oi.product_code_id = $1 AND o.status = 'Pending'`,
+      [id]
+    )
+    const soldRes = await pool.query(
+      `SELECT COALESCE(SUM(oi.qty), 0)::int AS sold
+       FROM order_items oi
+       JOIN orders o ON o.id = oi.order_id
+       WHERE oi.product_code_id = $1 AND o.status = 'Completed'`,
+      [id]
+    )
+    const avgRes = await pool.query(
+      `SELECT COALESCE(SUM(oi.qty), 0)::float AS monthly_avg
+       FROM order_items oi
+       JOIN orders o ON o.id = oi.order_id
+       WHERE oi.product_code_id = $1
+         AND o.status = 'Completed'
+         AND TO_CHAR(COALESCE(o.closed_at, o.created_at), 'YYYY-MM') =
+             TO_CHAR(CURRENT_TIMESTAMP, 'YYYY-MM')`,
+      [id]
+    )
+
+    const stockQty = Math.max(0, Number(updated.rows[0].stock_qty) || 0)
+    const booked = Number(bookedRes.rows[0]?.booked) || 0
+    res.json({
+      ...updated.rows[0],
+      stock_qty: stockQty,
+      items: refreshedItems,
+      qty_available: stockQty,
+      booked,
+      required_qty: booked,
+      sold: Number(soldRes.rows[0]?.sold) || 0,
+      monthly_avg: Number(avgRes.rows[0]?.monthly_avg) || 0,
+      product_qty_added: qty,
+      stock_before: before,
+      deductions,
+      date,
+    })
+  } catch (error) {
+    await client.query('ROLLBACK')
+    console.error('Error adding product qty:', error)
+    res.status(500).json({ message: 'Server error' })
+  } finally {
+    client.release()
   }
 })
 
@@ -2202,6 +3550,20 @@ app.put('/api/product-codes/:id', requireRoles(['admin', 'inventory']), async (r
   }
 })
 
+async function syncAllProductMonthlyStats(client = pool) {
+  const codes = await client.query('SELECT id FROM product_codes')
+  for (const row of codes.rows) {
+    await syncProductMonthlyStats(Number(row.id), client)
+  }
+}
+
+async function syncAllInventoryMonthlyStats(client = pool) {
+  const items = await client.query('SELECT id FROM inventory')
+  for (const row of items.rows) {
+    await syncInventoryMonthlyStats(Number(row.id), client)
+  }
+}
+
 app.delete('/api/product-codes/:id', requireRoles(['admin']), async (req, res) => {
   try {
     const result = await pool.query('DELETE FROM product_codes WHERE id = $1 RETURNING id', [req.params.id])
@@ -2211,6 +3573,520 @@ app.delete('/api/product-codes/:id', requireRoles(['admin']), async (req, res) =
     res.json({ message: 'Product code deleted.' })
   } catch (error) {
     console.error('Error deleting product code:', error)
+    res.status(500).json({ message: 'Server error' })
+  }
+})
+
+// ─── Reports ─────────────────────────────────────────────────────────────────
+app.get('/api/reports/summary', requireRoles(['admin', 'sales', 'inventory']), async (req, res) => {
+  try {
+    const thisMonth = currentYearMonth()
+    const [
+      ordersTotal,
+      ordersPending,
+      ordersCompleted,
+      ordersCancelled,
+      soldMonth,
+      revenueMonth,
+      revenueAll,
+      productsCount,
+      inventoryCount,
+      lowStock,
+      customersCount,
+    ] = await Promise.all([
+      pool.query(`SELECT COUNT(*)::int AS n, COALESCE(SUM(qty), 0)::int AS qty FROM orders WHERE status <> 'Cancelled'`),
+      pool.query(`SELECT COUNT(*)::int AS n FROM orders WHERE status = 'Pending'`),
+      pool.query(`SELECT COUNT(*)::int AS n FROM orders WHERE status = 'Completed'`),
+      pool.query(`SELECT COUNT(*)::int AS n FROM orders WHERE status = 'Cancelled'`),
+      pool.query(
+        `SELECT COALESCE(SUM(oi.qty), 0)::int AS qty
+         FROM order_items oi
+         JOIN orders o ON o.id = oi.order_id
+         WHERE o.status = 'Completed'
+           AND TO_CHAR(COALESCE(o.closed_at, o.created_at), 'YYYY-MM') = $1`,
+        [thisMonth]
+      ),
+      pool.query(
+        `SELECT COALESCE(SUM(
+           NULLIF(regexp_replace(COALESCE(amount, '0'), '[^0-9.]', '', 'g'), '')::numeric
+         ), 0) AS amount
+         FROM orders
+         WHERE status = 'Completed'
+           AND TO_CHAR(COALESCE(closed_at, created_at), 'YYYY-MM') = $1`,
+        [thisMonth]
+      ),
+      pool.query(
+        `SELECT COALESCE(SUM(
+           NULLIF(regexp_replace(COALESCE(amount, '0'), '[^0-9.]', '', 'g'), '')::numeric
+         ), 0) AS amount
+         FROM orders
+         WHERE status = 'Completed'`
+      ),
+      pool.query(`SELECT COUNT(*)::int AS n FROM product_codes`),
+      pool.query(`SELECT COUNT(*)::int AS n FROM inventory`),
+      pool.query(
+        `SELECT COUNT(*)::int AS n FROM inventory WHERE status IN ('Low Stock', 'Defect', 'Critical')`
+      ),
+      pool.query(`SELECT COUNT(*)::int AS n FROM customers`),
+    ])
+
+    res.json({
+      current_month: thisMonth,
+      current_label: formatYearMonthLabel(thisMonth),
+      orders: {
+        total: ordersTotal.rows[0].n,
+        qty: ordersTotal.rows[0].qty,
+        pending: ordersPending.rows[0].n,
+        completed: ordersCompleted.rows[0].n,
+        cancelled: ordersCancelled.rows[0].n,
+      },
+      sold_this_month: soldMonth.rows[0].qty,
+      revenue_this_month: Number(revenueMonth.rows[0].amount) || 0,
+      revenue_all_time: Number(revenueAll.rows[0].amount) || 0,
+      products: productsCount.rows[0].n,
+      inventory: inventoryCount.rows[0].n,
+      low_stock: lowStock.rows[0].n,
+      customers: customersCount.rows[0].n,
+    })
+  } catch (error) {
+    console.error('Error fetching report summary:', error)
+    res.status(500).json({ message: 'Server error' })
+  }
+})
+
+app.get('/api/reports/history', requireRoles(['admin', 'sales', 'inventory']), async (req, res) => {
+  try {
+    const scope = String(req.query.scope || 'orders')
+    const month = String(req.query.month || '').trim() // YYYY-MM or empty = all
+    const limit = Math.min(500, Math.max(50, Number(req.query.limit) || 200))
+
+    if (scope === 'orders') {
+      const params = []
+      let where = `WHERE o.status <> 'Cancelled'`
+      if (month) {
+        params.push(month)
+        where += ` AND TO_CHAR(COALESCE(o.closed_at, o.created_at), 'YYYY-MM') = $${params.length}`
+      }
+      params.push(limit)
+      const result = await pool.query(
+        `SELECT
+           o.order_no,
+           o.company,
+           COALESCE(oi.product_code, o.product_code, '—') AS product_code,
+           COALESCE(oi.product_name, o.product_name, '—') AS product_name,
+           COALESCE(oi.qty, o.qty, 0)::int AS qty,
+           o.amount,
+           o.status,
+           COALESCE(o.date, TO_CHAR(o.created_at, 'DD Mon YYYY')) AS date,
+           TO_CHAR(COALESCE(o.closed_at, o.created_at), 'YYYY-MM') AS year_month,
+           o.created_at
+         FROM orders o
+         LEFT JOIN order_items oi ON oi.order_id = o.id
+         ${where}
+         ORDER BY o.created_at DESC
+         LIMIT $${params.length}`,
+        params
+      )
+      return res.json({
+        scope: 'orders',
+        month: month || null,
+        rows: result.rows.map((r) => ({
+          ...r,
+          month_label: formatYearMonthLabel(r.year_month),
+          qty: Number(r.qty) || 0,
+        })),
+      })
+    }
+
+    if (scope === 'products') {
+      const params = []
+      let where = ''
+      if (month) {
+        params.push(month)
+        where = `WHERE TO_CHAR(m.created_at, 'YYYY-MM') = $1`
+      }
+      params.push(limit)
+      const result = await pool.query(
+        `SELECT
+           pc.code AS product_code,
+           pc.name AS product_name,
+           m.label,
+           m.qty::int AS qty,
+           m.stock_after::int AS stock_after,
+           m.movement_date AS date,
+           TO_CHAR(m.created_at, 'YYYY-MM') AS year_month,
+           m.created_at
+         FROM product_stock_movements m
+         JOIN product_codes pc ON pc.id = m.product_code_id
+         ${where}
+         ORDER BY m.created_at DESC
+         LIMIT $${params.length}`,
+        params
+      )
+      return res.json({
+        scope: 'products',
+        month: month || null,
+        rows: result.rows.map((r) => ({
+          ...r,
+          month_label: formatYearMonthLabel(r.year_month),
+          qty: Number(r.qty) || 0,
+          stock_after: Number(r.stock_after) || 0,
+        })),
+      })
+    }
+
+    // inventory movements + sales usage history
+    const params = []
+    let where = ''
+    if (month) {
+      params.push(month)
+      where = `WHERE TO_CHAR(m.created_at, 'YYYY-MM') = $1`
+    }
+    params.push(limit)
+    const moves = await pool.query(
+      `SELECT
+         i.name AS inventory_name,
+         COALESCE(m.order_no, '—') AS ref,
+         COALESCE(m.product_code, '—') AS product_code,
+         m.qty::int AS qty,
+         m.movement_date AS date,
+         CASE WHEN m.qty > 0 THEN 'Inward' WHEN m.qty < 0 THEN 'Used / Stock' ELSE 'Move' END AS type,
+         TO_CHAR(m.created_at, 'YYYY-MM') AS year_month,
+         m.created_at
+       FROM inventory_movements m
+       JOIN inventory i ON i.id = m.inventory_id
+       ${where}
+       ORDER BY m.created_at DESC
+       LIMIT $${params.length}`,
+      params
+    )
+    res.json({
+      scope: 'inventory',
+      month: month || null,
+      rows: moves.rows.map((r) => ({
+        ...r,
+        month_label: formatYearMonthLabel(r.year_month),
+        qty: Number(r.qty) || 0,
+      })),
+    })
+  } catch (error) {
+    console.error('Error fetching report history:', error)
+    res.status(500).json({ message: 'Server error' })
+  }
+})
+
+app.get('/api/reports/monthly-avg', requireRoles(['admin', 'sales', 'inventory']), async (req, res) => {
+  try {
+    const scope = String(req.query.scope || 'both') // products | inventory | both
+    const month = String(req.query.month || '').trim() // YYYY-MM or empty = all months
+
+    if (scope === 'products' || scope === 'both') {
+      await syncAllProductMonthlyStats()
+    }
+    if (scope === 'inventory' || scope === 'both') {
+      await syncAllInventoryMonthlyStats()
+    }
+
+    const thisMonth = currentYearMonth()
+    const rows = []
+
+    if (scope === 'products' || scope === 'both') {
+      const params = ['product']
+      let monthFilter = ''
+      if (month) {
+        params.push(month)
+        monthFilter = ` AND s.year_month = $${params.length}`
+      }
+      const result = await pool.query(
+        `SELECT
+           s.year_month,
+           s.qty::float AS qty,
+           pc.id AS ref_id,
+           pc.code,
+           pc.name
+         FROM monthly_qty_stats s
+         JOIN product_codes pc ON pc.id = s.ref_id
+         WHERE s.kind = $1
+           ${monthFilter}
+         ORDER BY s.year_month DESC, pc.code ASC`,
+        params
+      )
+      for (const r of result.rows) {
+        rows.push({
+          kind: 'product',
+          ref_id: r.ref_id,
+          code: r.code,
+          name: r.name,
+          year_month: r.year_month,
+          month_label: formatYearMonthLabel(r.year_month),
+          qty: Number(r.qty) || 0,
+          metric: 'Sold',
+          is_current: r.year_month === thisMonth,
+        })
+      }
+    }
+
+    if (scope === 'inventory' || scope === 'both') {
+      const params = ['inventory']
+      let monthFilter = ''
+      if (month) {
+        params.push(month)
+        monthFilter = ` AND s.year_month = $${params.length}`
+      }
+      const result = await pool.query(
+        `SELECT
+           s.year_month,
+           s.qty::float AS qty,
+           i.id AS ref_id,
+           i.name,
+           i.sku
+         FROM monthly_qty_stats s
+         JOIN inventory i ON i.id = s.ref_id
+         WHERE s.kind = $1
+           ${monthFilter}
+         ORDER BY s.year_month DESC, i.name ASC`,
+        params
+      )
+      for (const r of result.rows) {
+        rows.push({
+          kind: 'inventory',
+          ref_id: r.ref_id,
+          code: r.sku || '—',
+          name: r.name,
+          year_month: r.year_month,
+          month_label: formatYearMonthLabel(r.year_month),
+          qty: Number(r.qty) || 0,
+          metric: 'Used',
+          is_current: r.year_month === thisMonth,
+        })
+      }
+    }
+
+    // available months list for UI dropdown
+    const monthsRes = await pool.query(
+      `SELECT DISTINCT year_month FROM monthly_qty_stats ORDER BY year_month DESC`
+    )
+
+    res.json({
+      scope,
+      month: month || null,
+      current_month: thisMonth,
+      current_label: formatYearMonthLabel(thisMonth),
+      months: monthsRes.rows.map((r) => ({
+        year_month: r.year_month,
+        label: formatYearMonthLabel(r.year_month),
+        is_current: r.year_month === thisMonth,
+      })),
+      rows,
+    })
+  } catch (error) {
+    console.error('Error fetching monthly avg report:', error)
+    res.status(500).json({ message: 'Server error' })
+  }
+})
+
+/** Every product: customers, sold qty + revenue (monthly avg, FY, lifetime) */
+app.get('/api/reports/products-detail', requireRoles(['admin', 'sales', 'inventory']), async (req, res) => {
+  try {
+    const now = new Date()
+    const fy = getFinancialYear(now)
+    const fyStart = new Date(fy.startYear, 3, 1)
+    const fyEnd = new Date(fy.endYear, 2, 31, 23, 59, 59)
+    const thisYm = currentYearMonth()
+
+    const codes = await pool.query(
+      `SELECT id, code, name, COALESCE(stock_qty, 0)::int AS stock_qty
+       FROM product_codes
+       ORDER BY code ASC`
+    )
+    const linesRes = await pool.query(
+      `SELECT
+         oi.product_code_id,
+         o.company,
+         o.status,
+         oi.qty::int AS qty,
+         oi.amount,
+         COALESCE(o.closed_at, o.created_at) AS event_at
+       FROM order_items oi
+       JOIN orders o ON o.id = oi.order_id
+       WHERE oi.product_code_id IS NOT NULL
+         AND o.status <> 'Cancelled'`
+    )
+
+    const byProduct = new Map()
+    for (const code of codes.rows) {
+      byProduct.set(Number(code.id), {
+        product_code_id: Number(code.id),
+        code: code.code,
+        name: code.name,
+        available: Math.max(0, Number(code.stock_qty) || 0),
+        customers: new Set(),
+        pending_qty: 0,
+        sold_qty: 0,
+        lifetime_revenue: 0,
+        fy_qty: 0,
+        fy_revenue: 0,
+        this_month_qty: 0,
+        this_month_revenue: 0,
+        monthKeys: new Set(),
+      })
+    }
+
+    for (const row of linesRes.rows) {
+      const pid = Number(row.product_code_id)
+      const bucket = byProduct.get(pid)
+      if (!bucket) continue
+      const company = String(row.company || '').trim()
+      if (company) bucket.customers.add(company.toLowerCase())
+      const qty = Number(row.qty) || 0
+      const amt = parseAmount(row.amount)
+      const d = new Date(row.event_at)
+      const ym = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`
+      if (row.status === 'Pending') bucket.pending_qty += qty
+      if (row.status === 'Completed') {
+        bucket.sold_qty += qty
+        bucket.lifetime_revenue += amt
+        if (!Number.isNaN(d.getTime())) {
+          bucket.monthKeys.add(ym)
+          if (d >= fyStart && d <= fyEnd) {
+            bucket.fy_qty += qty
+            bucket.fy_revenue += amt
+          }
+          if (ym === thisYm) {
+            bucket.this_month_qty += qty
+            bucket.this_month_revenue += amt
+          }
+        }
+      }
+    }
+
+    const rows = [...byProduct.values()].map((b) => {
+      const monthsActive = Math.max(1, b.monthKeys.size || 1)
+      return {
+        product_code_id: b.product_code_id,
+        code: b.code,
+        name: b.name,
+        available: b.available,
+        customers_count: b.customers.size,
+        pending_qty: b.pending_qty,
+        sold_qty: b.sold_qty,
+        monthly_avg_qty: Math.round((b.sold_qty / monthsActive) * 10) / 10,
+        fy_qty: b.fy_qty,
+        lifetime_qty: b.sold_qty,
+        this_month_qty: b.this_month_qty,
+        monthly_avg_revenue: Math.round(b.lifetime_revenue / monthsActive),
+        monthly_avg_revenue_label: formatRupee(Math.round(b.lifetime_revenue / monthsActive)),
+        fy_revenue: b.fy_revenue,
+        fy_revenue_label: formatRupee(b.fy_revenue),
+        lifetime_revenue: b.lifetime_revenue,
+        lifetime_revenue_label: formatRupee(b.lifetime_revenue),
+        this_month_revenue: b.this_month_revenue,
+        this_month_revenue_label: formatRupee(b.this_month_revenue),
+        fy_label: `FY ${fy.label}`,
+        months_active: monthsActive,
+      }
+    })
+
+    res.json({
+      fy_label: `FY ${fy.label}`,
+      current_month: thisYm,
+      rows,
+    })
+  } catch (error) {
+    console.error('Error fetching products detail report:', error)
+    res.status(500).json({ message: 'Server error' })
+  }
+})
+
+/** Every inventory part: customers, used qty — monthly avg / FY / lifetime */
+app.get('/api/reports/inventory-detail', requireRoles(['admin', 'sales', 'inventory']), async (req, res) => {
+  try {
+    const now = new Date()
+    const fy = getFinancialYear(now)
+    const fyStart = new Date(fy.startYear, 3, 1)
+    const fyEnd = new Date(fy.endYear, 2, 31, 23, 59, 59)
+    const thisYm = currentYearMonth()
+
+    const items = await pool.query(
+      `SELECT id, name, sku, available, status FROM inventory ORDER BY name ASC`
+    )
+    const usageRes = await pool.query(
+      `SELECT
+         pci.inventory_id,
+         o.company,
+         o.status,
+         (pci.qty_per_unit * oi.qty)::int AS qty,
+         COALESCE(o.closed_at, o.created_at) AS event_at
+       FROM product_code_items pci
+       JOIN order_items oi ON oi.product_code_id = pci.product_code_id
+       JOIN orders o ON o.id = oi.order_id
+       WHERE o.status <> 'Cancelled'`
+    )
+
+    const byInv = new Map()
+    for (const item of items.rows) {
+      byInv.set(Number(item.id), {
+        inventory_id: Number(item.id),
+        name: item.name,
+        sku: item.sku || '',
+        available: Number(item.available) || 0,
+        status: item.status,
+        customers: new Set(),
+        pending_qty: 0,
+        used_qty: 0,
+        fy_qty: 0,
+        this_month_qty: 0,
+        monthKeys: new Set(),
+      })
+    }
+
+    for (const row of usageRes.rows) {
+      const id = Number(row.inventory_id)
+      const bucket = byInv.get(id)
+      if (!bucket) continue
+      const company = String(row.company || '').trim()
+      if (company) bucket.customers.add(company.toLowerCase())
+      const qty = Number(row.qty) || 0
+      const d = new Date(row.event_at)
+      const ym = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`
+      if (row.status === 'Pending') bucket.pending_qty += qty
+      if (row.status === 'Completed') {
+        bucket.used_qty += qty
+        if (!Number.isNaN(d.getTime())) {
+          bucket.monthKeys.add(ym)
+          if (d >= fyStart && d <= fyEnd) bucket.fy_qty += qty
+          if (ym === thisYm) bucket.this_month_qty += qty
+        }
+      }
+    }
+
+    const rows = [...byInv.values()].map((b) => {
+      const monthsActive = Math.max(1, b.monthKeys.size || 1)
+      return {
+        inventory_id: b.inventory_id,
+        name: b.name,
+        sku: b.sku,
+        available: b.available,
+        status: b.status,
+        customers_count: b.customers.size,
+        pending_qty: b.pending_qty,
+        used_qty: b.used_qty,
+        monthly_avg_qty: Math.round((b.used_qty / monthsActive) * 10) / 10,
+        fy_qty: b.fy_qty,
+        lifetime_qty: b.used_qty,
+        this_month_qty: b.this_month_qty,
+        fy_label: `FY ${fy.label}`,
+        months_active: monthsActive,
+      }
+    })
+
+    res.json({
+      fy_label: `FY ${fy.label}`,
+      current_month: thisYm,
+      rows,
+    })
+  } catch (error) {
+    console.error('Error fetching inventory detail report:', error)
     res.status(500).json({ message: 'Server error' })
   }
 })

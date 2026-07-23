@@ -7,7 +7,9 @@ export default defineConfig({
   server: {
     proxy: {
       '/api': {
-        target: 'http://localhost:5000',
+        // Use 127.0.0.1 (not localhost) — on Windows localhost can resolve to ::1
+        // while the backend listens on IPv4 only, which causes ECONNREFUSED / empty data.
+        target: 'http://127.0.0.1:5000',
         changeOrigin: true,
       },
     },

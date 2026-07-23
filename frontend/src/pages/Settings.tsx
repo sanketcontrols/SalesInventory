@@ -1,4 +1,4 @@
-import { Building2, KeyRound, LogOut, RefreshCw, Save, Shield, Users } from 'lucide-react'
+import { Building2, KeyRound, LogOut, Package, RefreshCw, Save, Shield, Users } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import { useAuth } from '../context/AuthContext'
@@ -25,6 +25,7 @@ export default function Settings() {
   const navigate = useNavigate()
   const { user, role, setUser, refreshUser } = useAuth()
   const isAdmin = role === 'admin'
+  const canInventorySettings = role === 'admin' || role === 'inventory'
   const token = typeof window !== 'undefined' ? localStorage.getItem('token') : null
 
   const [profileName, setProfileName] = useState(user?.name || '')
@@ -44,6 +45,11 @@ export default function Settings() {
   const [companyMsg, setCompanyMsg] = useState('')
   const [companySaving, setCompanySaving] = useState(false)
   const [companyLoading, setCompanyLoading] = useState(false)
+
+  const [lowStockTarget, setLowStockTarget] = useState('20')
+  const [lowStockMsg, setLowStockMsg] = useState('')
+  const [lowStockSaving, setLowStockSaving] = useState(false)
+  const [lowStockLoading, setLowStockLoading] = useState(false)
 
   const [refreshing, setRefreshing] = useState(false)
 
@@ -66,6 +72,17 @@ export default function Settings() {
       .catch(console.error)
       .finally(() => setCompanyLoading(false))
   }, [isAdmin])
+
+  useEffect(() => {
+    if (!canInventorySettings) return
+    setLowStockLoading(true)
+    apiFetch<{ low_stock_target: number }>('/api/inventory/settings')
+      .then((data) => {
+        setLowStockTarget(String(data.low_stock_target ?? 20))
+      })
+      .catch(console.error)
+      .finally(() => setLowStockLoading(false))
+  }, [canInventorySettings])
 
   const initials = user?.name
     ? user.name
@@ -161,6 +178,28 @@ export default function Settings() {
       setCompanyMsg(error instanceof Error ? error.message : 'Failed to save company details')
     } finally {
       setCompanySaving(false)
+    }
+  }
+
+  const handleSaveLowStock = async () => {
+    setLowStockMsg('')
+    const target = Math.floor(Number(lowStockTarget))
+    if (!Number.isFinite(target) || target < 0) {
+      setLowStockMsg('Enter a number 0 or higher')
+      return
+    }
+    setLowStockSaving(true)
+    try {
+      const saved = await apiFetch<{ low_stock_target: number }>('/api/inventory/settings', {
+        method: 'PUT',
+        body: JSON.stringify({ low_stock_target: target }),
+      })
+      setLowStockTarget(String(saved.low_stock_target))
+      setLowStockMsg(`Saved. Inventory shows Low Stock when available is below ${saved.low_stock_target}.`)
+    } catch (error) {
+      setLowStockMsg(error instanceof Error ? error.message : 'Failed to save low stock target')
+    } finally {
+      setLowStockSaving(false)
     }
   }
 
@@ -295,6 +334,54 @@ export default function Settings() {
               </div>
             )}
           </Card>
+
+          {canInventorySettings && (
+            <Card>
+              <SectionTitle
+                title="Low stock target"
+                subtitle="When available qty goes below this number, status becomes Low Stock."
+                action={
+                  <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-amber-50 text-amber-700">
+                    <Package className="h-4 w-4" />
+                  </div>
+                }
+              />
+              {lowStockLoading ? (
+                <p className="text-sm text-slate-500">Loading…</p>
+              ) : (
+                <>
+                  <Field label="Low stock when available is below">
+                    <Input
+                      type="number"
+                      min={0}
+                      value={lowStockTarget}
+                      onChange={(e) => setLowStockTarget(e.target.value)}
+                      placeholder="e.g. 20"
+                    />
+                  </Field>
+                  <p className="mt-2 text-xs text-slate-500">
+                    Example: set <span className="font-medium text-slate-700">20</span> → qty 19 or less =
+                    Low Stock · qty 20+ = Stock Available (unless booked demand is higher).
+                  </p>
+                  {lowStockMsg && (
+                    <p
+                      className={`mt-3 text-sm ${
+                        lowStockMsg.toLowerCase().includes('saved')
+                          ? 'text-emerald-600'
+                          : 'text-rose-600'
+                      }`}
+                    >
+                      {lowStockMsg}
+                    </p>
+                  )}
+                  <Button className="mt-4" onClick={handleSaveLowStock} disabled={lowStockSaving}>
+                    <Save className="h-4 w-4" />
+                    {lowStockSaving ? 'Saving…' : 'Save low stock target'}
+                  </Button>
+                </>
+              )}
+            </Card>
+          )}
 
           {isAdmin && (
             <Card>

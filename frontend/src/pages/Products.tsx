@@ -1,7 +1,10 @@
-import { Plus, Trash2, Pencil, Search, Package, Layers, X } from 'lucide-react'
+import { Plus, Minus, Trash2, Pencil, Search, Package, Layers, X, ExternalLink } from 'lucide-react'
 import { Fragment, useEffect, useMemo, useRef, useState } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { apiFetch, getStoredUser } from '../services/api'
 import { canDelete } from '../utils/roleAccess'
+import ImportExcelButton from '../components/ImportExcelButton'
+import MonthlyAvgHistory from '../components/MonthlyAvgHistory'
 import {
   Badge,
   Button,
@@ -40,6 +43,7 @@ interface CodeItem {
   sku?: string
   available?: number
   booked?: number
+  required_qty?: number
 }
 
 interface ProductCode {
@@ -48,8 +52,92 @@ interface ProductCode {
   name: string
   description: string
   items: CodeItem[]
+  stock_qty?: number
   qty_available?: number | null
+  /** Pending order demand (same as required_qty) */
   booked?: number
+  required_qty?: number
+  sold?: number
+  monthly_avg?: number
+}
+
+function requiredOf(p: { booked?: number; required_qty?: number }) {
+  return p.booked ?? p.required_qty ?? 0
+}
+
+function itemRequiredOf(item: { booked?: number; required_qty?: number }) {
+  return item.booked ?? item.required_qty ?? 0
+}
+
+interface BookingRow {
+  type?: string
+  company: string
+  order_no: string
+  qty: number
+  date: string
+  status?: string
+  created_at?: string
+}
+
+interface StockHistoryRow {
+  type?: string
+  label: string
+  qty: number
+  stock_after: number
+  date: string
+  note?: string
+  created_at?: string
+}
+
+type HistoryRow = {
+  key: string
+  kind: 'stock' | 'order'
+  detail: string
+  order_no: string
+  qty: number
+  qtyLabel: string
+  date: string
+  status: string
+  /** stock add → green; required/pending → amber; sold → red */
+  qtyTone: 'green' | 'amber' | 'red'
+  sortAt: number
+}
+
+function mergeProductHistory(
+  productId: number,
+  bookings: BookingRow[],
+  stockHistory: StockHistoryRow[]
+): HistoryRow[] {
+  const rows: HistoryRow[] = [
+    ...stockHistory.map((h, idx) => ({
+      key: `${productId}-s-${idx}`,
+      kind: 'stock' as const,
+      detail: h.label || 'Stock',
+      order_no: '—',
+      qty: h.qty,
+      qtyLabel: `+${h.qty}`,
+      date: h.date,
+      status: 'Add in stock',
+      qtyTone: 'green' as const,
+      sortAt: h.created_at ? new Date(h.created_at).getTime() : 0,
+    })),
+    ...bookings.map((b, idx) => {
+      const completed = b.status === 'Completed'
+      return {
+        key: `${productId}-o-${idx}`,
+        kind: 'order' as const,
+        detail: b.company || '—',
+        order_no: b.order_no || '—',
+        qty: b.qty,
+        qtyLabel: String(b.qty),
+        date: b.date,
+        status: b.status || '—',
+        qtyTone: (completed ? 'red' : 'amber') as 'red' | 'amber',
+        sortAt: b.created_at ? new Date(b.created_at).getTime() : 0,
+      }
+    }),
+  ]
+  return rows.sort((a, b) => b.sortAt - a.sortAt)
 }
 
 type ProductFormState = {
@@ -68,7 +156,11 @@ const emptyForm = (): ProductFormState => ({
   items: [],
 })
 
+const todayLabel = () =>
+  new Date().toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' })
+
 export default function Products() {
+  const navigate = useNavigate()
   const user = getStoredUser()
   const canRemove = canDelete(user?.role)
   const formRef = useRef<HTMLDivElement>(null)
@@ -83,6 +175,13 @@ export default function Products() {
   const [form, setForm] = useState<ProductFormState>(emptyForm())
   const [invSearch, setInvSearch] = useState('')
   const [showInvSuggest, setShowInvSuggest] = useState(false)
+
+  const [expandedIds, setExpandedIds] = useState<Set<number>>(new Set())
+  const [bookingsById, setBookingsById] = useState<Record<number, BookingRow[]>>({})
+  const [stockHistoryById, setStockHistoryById] = useState<Record<number, StockHistoryRow[]>>({})
+  const [addQtyId, setAddQtyId] = useState<number | null>(null)
+  const [addQtyForm, setAddQtyForm] = useState({ stock: 'Stock', qty: '', date: todayLabel() })
+  const [savingQtyId, setSavingQtyId] = useState<number | null>(null)
 
   useEffect(() => {
     fetchAll()
@@ -109,6 +208,89 @@ export default function Products() {
     }
   }
 
+  const loadBookings = async (productId: number) => {
+    try {
+      const data = await apiFetch<{ bookings: BookingRow[]; stock_history?: StockHistoryRow[] }>(
+        `/api/product-codes/${productId}/bookings`
+      )
+      setBookingsById((prev) => ({ ...prev, [productId]: data.bookings || [] }))
+      setStockHistoryById((prev) => ({ ...prev, [productId]: data.stock_history || [] }))
+    } catch (error) {
+      console.error(error)
+      setBookingsById((prev) => ({ ...prev, [productId]: [] }))
+      setStockHistoryById((prev) => ({ ...prev, [productId]: [] }))
+    }
+  }
+
+  const toggleExpand = async (productId: number, e?: React.MouseEvent) => {
+    e?.stopPropagation()
+    const willOpen = !expandedIds.has(productId)
+    setExpandedIds((prev) => {
+      const next = new Set(prev)
+      if (next.has(productId)) next.delete(productId)
+      else next.add(productId)
+      return next
+    })
+    if (willOpen && (!bookingsById[productId] || !stockHistoryById[productId])) {
+      await loadBookings(productId)
+    }
+  }
+
+  const openAddQty = (product: ProductCode, e?: React.MouseEvent) => {
+    e?.stopPropagation()
+    if (!product.items.length) {
+      alert('Link inventory parts first before adding product stock.')
+      return
+    }
+    setAddQtyId(product.id)
+    setAddQtyForm({ stock: 'Stock', qty: '', date: todayLabel() })
+    setExpandedIds((prev) => new Set(prev).add(product.id))
+    if (!bookingsById[product.id]) loadBookings(product.id)
+  }
+
+  const submitAddQty = async (product: ProductCode) => {
+    const qty = Number(addQtyForm.qty)
+    if (!Number.isFinite(qty) || qty <= 0) {
+      alert('Enter product qty greater than 0')
+      return
+    }
+    setSavingQtyId(product.id)
+    try {
+      const updated = await apiFetch<
+        ProductCode & {
+          product_qty_added?: number
+          stock_before?: number
+          deductions?: { name: string; deducted: number; available?: number }[]
+        }
+      >(`/api/product-codes/${product.id}/add-qty`, {
+        method: 'POST',
+        body: JSON.stringify({
+          qty,
+          stock: addQtyForm.stock || 'Stock',
+          date: addQtyForm.date || todayLabel(),
+        }),
+      })
+      setProducts((prev) => prev.map((row) => (row.id === product.id ? { ...row, ...updated } : row)))
+      setAddQtyId(null)
+      setAddQtyForm({ stock: 'Stock', qty: '', date: todayLabel() })
+      await fetchAll()
+      await loadBookings(product.id)
+      const before = updated.stock_before ?? 0
+      const after = Math.max(0, updated.qty_available ?? updated.stock_qty ?? before + qty)
+      const parts = (updated.deductions || [])
+        .map((d) => `${d.name}: −${d.deducted}`)
+        .join('\n')
+      alert(
+        `Product ${product.code}: +${qty} ( Available Qty: ${before} → ${after})\n` +
+          `Linked inventory deducted:\n${parts || '(none)'}`
+      )
+    } catch (error) {
+      alert(error instanceof Error ? error.message : 'Failed to add product qty')
+    } finally {
+      setSavingQtyId(null)
+    }
+  }
+
   const filteredProducts = useMemo(() => {
     const q = search.trim().toLowerCase()
     if (!q) return products
@@ -127,7 +309,9 @@ export default function Products() {
       if (!p.items.length) return false
       return p.items.some((i) => (i.available ?? 0) <= 0)
     }).length
-    return { total: products.length, withBom, lowStock }
+    const requiredTotal = products.reduce((sum, p) => sum + requiredOf(p), 0)
+    const soldTotal = products.reduce((sum, p) => sum + (p.sold ?? 0), 0)
+    return { total: products.length, withBom, lowStock, requiredTotal, soldTotal }
   }, [products])
 
   const invSuggestions = useMemo(() => {
@@ -241,6 +425,21 @@ export default function Products() {
     }
   }
 
+  const handleStkSumImport = async (rows: Record<string, string>[]) => {
+    const result = await apiFetch<{ imported: number; skipped?: number; total: number; errors: string[] }>(
+      '/api/product-codes/import',
+      {
+        method: 'POST',
+        body: JSON.stringify({ rows }),
+      }
+    )
+    alert(
+      `Products — added: ${result.imported}, skipped: ${result.skipped ?? 0}, total rows: ${result.total}` +
+        (result.errors.length ? `\nErrors: ${result.errors.slice(0, 3).join(', ')}` : '')
+    )
+    fetchAll()
+  }
+
   const getInvName = (inventoryId: number) => {
     return inventory.find((i) => i.id === inventoryId)?.name || `Inventory #${inventoryId}`
   }
@@ -250,14 +449,9 @@ export default function Products() {
   }
 
   const minAvailable = (product: ProductCode) => {
-    if (product.qty_available != null) return product.qty_available
-    if (!product.items.length) return null
-    return Math.min(
-      ...product.items.map((i) => {
-        const per = Number(i.qty_per_unit) || 1
-        return Math.floor((i.available ?? 0) / per)
-      })
-    )
+    const stock = product.qty_available ?? product.stock_qty
+    if (stock == null) return 0
+    return Math.max(0, Number(stock) || 0)
   }
 
   const renderFormFields = () => (
@@ -272,10 +466,7 @@ export default function Products() {
           />
         </Field>
         <Field label="Product Name">
-          <Select
-            value={form.name}
-            onChange={(e) => setForm({ ...form, name: e.target.value })}
-          >
+          <Select value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })}>
             <option value="">Select category…</option>
             {PRODUCT_CATEGORIES.map((cat) => (
               <option key={cat} value={cat}>
@@ -347,8 +538,8 @@ export default function Products() {
                 <Package className="h-4 w-4 shrink-0 text-slate-400" />
                 <div className="min-w-[160px] flex-1">
                   <p className="text-sm font-medium text-slate-900">{getInvName(item.inventory_id)}</p>
-                  <p className={`text-xs ${avail <= 0 ? 'font-semibold text-rose-600' : 'text-slate-500'}`}>
-                    {avail} qty available
+                  <p className={`text-xs ${avail <= 0 ? 'font-semibold text-rose-600' : 'font-semibold text-emerald-700'}`}>
+                    {avail} Available Qty
                   </p>
                 </div>
                 <label className="text-xs text-slate-500">Qty / unit</label>
@@ -386,19 +577,29 @@ export default function Products() {
     <div className="page-enter space-y-5">
       <PageHeader
         title="Products"
-        subtitle="Click a product row to edit it in place. Sales books all linked inventory by product qty."
+        subtitle="Click a product for full summary. + expands quick history. Available green · Required orange · Sold red."
         actions={
-          <Button onClick={openNew}>
-            <Plus className="h-4 w-4" />
-            Add Product
-          </Button>
+          <div className="flex flex-wrap gap-2">
+            <ImportExcelButton kind="stksum" onImport={handleStkSumImport} />
+            <Button onClick={openNew}>
+              <Plus className="h-4 w-4" />
+              Add Product
+            </Button>
+          </div>
         }
       />
 
-      <div className="grid gap-3 sm:grid-cols-3">
+      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
         <StatTile label="Total products" value={stats.total} accent="blue" />
         <StatTile label="With inventory BOM" value={stats.withBom} accent="emerald" />
         <StatTile label="Low / zero stock parts" value={stats.lowStock} accent="amber" hint="Any linked part ≤ 0" />
+        <StatTile label="Required Qty (pending)" value={stats.requiredTotal} accent="violet" hint="Open orders" />
+        <StatTile
+          label="Sold (completed)"
+          value={<span className="text-rose-600">{stats.soldTotal}</span>}
+          accent="rose"
+          hint="Closed delivery qty"
+        />
       </div>
 
       <div className="relative max-w-lg">
@@ -432,38 +633,59 @@ export default function Products() {
         <EmptyState message={search ? 'No products match your search.' : 'No products yet. Click Add Product.'} />
       ) : (
         <TableShell>
-          <table className="w-full min-w-[720px] text-left">
+          <table className="w-full min-w-[900px] text-left">
             <thead className={theadClass}>
               <tr>
+                <th className={`${thClass} w-10`} />
                 <th className={thClass}>Code</th>
                 <th className={thClass}>Product</th>
                 <th className={thClass}>Parts</th>
-                <th className={thClass}>Qty Available</th>
-                <th className={thClass}>Booked</th>
+                <th className={thClass}>Available Qty</th>
+                <th className={thClass}>Required Qty</th>
+                <th className={thClass}>Sold</th>
+                <th className={thClass}>This Month</th>
                 <th className={`${thClass} text-right`}>Actions</th>
               </tr>
             </thead>
             <tbody>
               {filteredProducts.map((product) => {
                 const isEditing = editingId === product.id
+                const expanded = expandedIds.has(product.id)
+                const bookings = bookingsById[product.id] || []
+                const stockHistory = stockHistoryById[product.id] || []
+                const history = mergeProductHistory(product.id, bookings, stockHistory)
                 const minQty = minAvailable(product)
                 const short = minQty != null && minQty <= 0
+                const colSpan = 9
                 return (
                   <Fragment key={product.id}>
                     <tr
                       className={`${trClass} cursor-pointer ${isEditing ? 'bg-blue-50/70 hover:bg-blue-50/70' : ''}`}
                       onClick={() => {
                         if (isEditing) return
-                        openEdit(product)
+                        navigate(`/products/${product.id}`)
                       }}
                     >
+                      <td className={tdClass} onClick={(e) => e.stopPropagation()}>
+                        <button
+                          type="button"
+                          onClick={(e) => toggleExpand(product.id, e)}
+                          className="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-slate-200 text-slate-600 hover:bg-slate-50"
+                          title={expanded ? 'Hide history' : 'Show history'}
+                        >
+                          {expanded ? <Minus className="h-3.5 w-3.5" /> : <Plus className="h-3.5 w-3.5" />}
+                        </button>
+                      </td>
                       <td className={tdClass}>
                         <span className="inline-flex rounded-md bg-blue-50 px-2 py-0.5 font-mono text-xs font-semibold text-blue-700">
                           {product.code}
                         </span>
                       </td>
                       <td className={tdClass}>
-                        <p className="font-medium text-slate-900">{product.name}</p>
+                        <p className="inline-flex items-center gap-1.5 font-medium text-slate-900">
+                          {product.name}
+                          <ExternalLink className="h-3.5 w-3.5 text-slate-400" />
+                        </p>
                         {product.description ? (
                           <p className="mt-0.5 line-clamp-1 text-xs text-slate-500">{product.description}</p>
                         ) : null}
@@ -479,19 +701,37 @@ export default function Products() {
                         )}
                       </td>
                       <td className={tdClass}>
-                        {minQty == null ? (
-                          <span className="text-slate-400">—</span>
-                        ) : (
-                          <span className={`font-semibold tabular-nums ${short ? 'text-rose-600' : 'text-slate-900'}`}>
-                            {minQty}
-                          </span>
-                        )}
+                        <span
+                          className={`font-semibold tabular-nums ${
+                            short ? 'text-rose-600' : 'text-emerald-700'
+                          }`}
+                        >
+                          {minQty}
+                        </span>
                       </td>
                       <td className={tdClass}>
-                        <span className="font-medium tabular-nums text-amber-700">{product.booked ?? 0}</span>
+                        <span className="font-medium tabular-nums text-amber-700">{requiredOf(product)}</span>
+                      </td>
+                      <td className={tdClass}>
+                        <span className="font-semibold tabular-nums text-rose-600">
+                          {product.sold ?? 0}
+                        </span>
+                      </td>
+                      <td className={tdClass} onClick={(e) => e.stopPropagation()}>
+                        <MonthlyAvgHistory
+                          endpoint={`/api/product-codes/${product.id}/monthly-stats`}
+                          title={`${product.code} — monthly sold`}
+                          metricLabel="Sold qty"
+                          currentValue={product.monthly_avg ?? 0}
+                          tone="rose"
+                        />
                       </td>
                       <td className={`${tdClass} text-right`}>
                         <div className="inline-flex items-center gap-1.5" onClick={(e) => e.stopPropagation()}>
+                          <Button variant="secondary" size="sm" onClick={(e) => openAddQty(product, e)}>
+                            <Plus className="h-3.5 w-3.5" />
+                            Add Qty
+                          </Button>
                           <Button
                             variant={isEditing ? 'soft' : 'secondary'}
                             size="sm"
@@ -508,50 +748,241 @@ export default function Products() {
                         </div>
                       </td>
                     </tr>
+
+                    {expanded && (
+                      <tr className="bg-slate-50/80">
+                        <td colSpan={colSpan} className="px-4 py-4" onClick={(e) => e.stopPropagation()}>
+                          <div className="space-y-4 rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
+                            {addQtyId === product.id && (
+                              <div className="rounded-xl border border-blue-100 bg-blue-50/40 p-4">
+                                <p className="mb-1 text-sm font-semibold text-slate-900">Add Stock — {product.code}</p>
+                                <p className="mb-3 text-xs text-slate-500">
+                                  Adds <span className="font-semibold text-slate-700">+</span> to product Available Qty
+                                  and deducts <span className="font-semibold text-slate-700">−</span> every linked
+                                  inventory part (qty per unit × stock qty).
+                                </p>
+                                <div className="mb-3 grid gap-2 sm:grid-cols-3 text-xs">
+                                  <div className="rounded-lg border border-slate-200 bg-white px-3 py-2">
+                                    <p className="text-slate-500">Available Qty</p>
+                                    <p
+                                      className={`text-base font-semibold ${
+                                        short ? 'text-rose-600' : 'text-emerald-700'
+                                      }`}
+                                    >
+                                      {minQty ?? 0}
+                                    </p>
+                                    {Number(addQtyForm.qty) > 0 && (
+                                      <p className="mt-0.5 text-[10px] text-emerald-600">
+                                        After save: +{(minQty ?? 0) + Number(addQtyForm.qty)}
+                                      </p>
+                                    )}
+                                  </div>
+                                  <div className="rounded-lg border border-slate-200 bg-white px-3 py-2">
+                                    <p className="text-slate-500">Required Qty (pending)</p>
+                                    <p className="text-base font-semibold text-amber-700">{requiredOf(product)}</p>
+                                  </div>
+                                  <div className="rounded-lg border border-slate-200 bg-white px-3 py-2">
+                                    <p className="text-slate-500">Sold (completed)</p>
+                                    <p className="text-base font-semibold text-rose-600">{product.sold ?? 0}</p>
+                                  </div>
+                                </div>
+                                {product.items.length > 0 && (
+                                  <div className="mb-3 rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs">
+                                    <p className="mb-1.5 font-medium text-slate-700">
+                                      Linked inventory ({product.items.length}) — each will be minused
+                                    </p>
+                                    <ul className="space-y-1">
+                                      {product.items.map((item) => {
+                                        const avail = Math.max(0, item.available ?? 0)
+                                        const per = Number(item.qty_per_unit) || 1
+                                        const stockQty = Number(addQtyForm.qty) || 0
+                                        const willCut = stockQty > 0 ? per * stockQty : null
+                                        return (
+                                          <li
+                                            key={`add-${product.id}-${item.inventory_id}`}
+                                            className="flex flex-wrap items-center justify-between gap-2"
+                                          >
+                                            <span className="font-medium text-slate-800">
+                                              {item.name || getInvName(item.inventory_id)}{' '}
+                                              <span className="font-normal text-slate-500">×{per}</span>
+                                            </span>
+                                            <span className="tabular-nums text-slate-600">
+                                              avail <span className="font-semibold">{avail}</span>
+                                              {willCut != null && (
+                                                <span className="ml-2 text-rose-600">→ −{willCut}</span>
+                                              )}
+                                            </span>
+                                          </li>
+                                        )
+                                      })}
+                                    </ul>
+                                  </div>
+                                )}
+                                <div className="grid gap-3 sm:grid-cols-3">
+                                  <Field label="Stock">
+                                    <Input value={addQtyForm.stock} readOnly className="bg-slate-50 text-slate-600" />
+                                  </Field>
+                                  <Field label="Stock Qty">
+                                    <Input
+                                      type="number"
+                                      min={1}
+                                      value={addQtyForm.qty}
+                                      onChange={(e) => setAddQtyForm({ ...addQtyForm, qty: e.target.value })}
+                                      placeholder="e.g. 2"
+                                    />
+                                  </Field>
+                                  <Field label="Date">
+                                    <Input
+                                      value={addQtyForm.date}
+                                      onChange={(e) => setAddQtyForm({ ...addQtyForm, date: e.target.value })}
+                                    />
+                                  </Field>
+                                </div>
+                                {Number(addQtyForm.qty) > 0 && (
+                                  <div className="mt-3 rounded-lg border border-blue-100 bg-blue-50/60 px-3 py-2 text-xs text-slate-700">
+                                    Save: product <span className="font-semibold text-emerald-700">+{Number(addQtyForm.qty)}</span>
+                                    {' · '}
+                                    inventory{' '}
+                                    {product.items
+                                      .map(
+                                        (i) =>
+                                          `${i.name || getInvName(i.inventory_id)} −${
+                                            (Number(i.qty_per_unit) || 1) * Number(addQtyForm.qty)
+                                          }`
+                                      )
+                                      .join(' · ')}
+                                  </div>
+                                )}
+                                <div className="mt-3 flex flex-wrap gap-2">
+                                  <Button
+                                    size="sm"
+                                    onClick={() => submitAddQty(product)}
+                                    disabled={savingQtyId === product.id}
+                                  >
+                                    {savingQtyId === product.id ? 'Saving…' : 'Save Qty'}
+                                  </Button>
+                                  <Button size="sm" variant="secondary" onClick={() => setAddQtyId(null)}>
+                                    Cancel
+                                  </Button>
+                                </div>
+                              </div>
+                            )}
+
+                            <div>
+                              <p className="mb-2 text-sm font-semibold text-slate-900">History</p>
+                              <p className="mb-2 text-xs text-slate-500">
+                                Stock adds (green) · Required / Pending (orange) · Sold / Completed (red)
+                              </p>
+                              {history.length === 0 ? (
+                                <p className="text-sm text-slate-500">No history for this product yet.</p>
+                              ) : (
+                                <div className="overflow-hidden rounded-xl border border-slate-200">
+                                  <table className="w-full text-left text-sm">
+                                    <thead className="border-b border-slate-100 bg-slate-50 text-xs uppercase tracking-wide text-slate-500">
+                                      <tr>
+                                        <th className="px-3 py-2 font-semibold">Type</th>
+                                        <th className="px-3 py-2 font-semibold">Detail</th>
+                                        <th className="px-3 py-2 font-semibold">Order No</th>
+                                        <th className="px-3 py-2 font-semibold">Qty</th>
+                                        <th className="px-3 py-2 font-semibold">Date</th>
+                                        <th className="px-3 py-2 font-semibold">Status</th>
+                                      </tr>
+                                    </thead>
+                                    <tbody>
+                                      {history.map((h) => (
+                                        <tr key={h.key} className="border-b border-slate-50 last:border-0">
+                                          <td className="px-3 py-2 font-medium text-slate-800">
+                                            {h.kind === 'stock'
+                                              ? 'Stock'
+                                              : h.status === 'Completed'
+                                                ? 'Sold'
+                                                : 'Required'}
+                                          </td>
+                                          <td className="px-3 py-2 font-medium text-slate-800">{h.detail}</td>
+                                          <td className="px-3 py-2 font-mono text-xs text-slate-700">{h.order_no}</td>
+                                          <td
+                                            className={`px-3 py-2 font-semibold tabular-nums ${
+                                              h.qtyTone === 'green'
+                                                ? 'text-emerald-700'
+                                                : h.qtyTone === 'red'
+                                                  ? 'text-rose-600'
+                                                  : 'text-amber-700'
+                                            }`}
+                                          >
+                                            {h.qtyLabel}
+                                          </td>
+                                          <td className="px-3 py-2 text-slate-600">{h.date}</td>
+                                          <td className="px-3 py-2 text-slate-600">{h.status}</td>
+                                        </tr>
+                                      ))}
+                                    </tbody>
+                                  </table>
+                                </div>
+                              )}
+                            </div>
+
+                            {product.items.length > 0 && (
+                              <div>
+                                <p className="mb-2 text-sm font-semibold text-slate-900">Linked inventory (available qty)</p>
+                                <div className="overflow-hidden rounded-xl border border-slate-200">
+                                  <table className="w-full text-left text-sm">
+                                    <thead className="border-b border-slate-100 bg-slate-50 text-xs uppercase tracking-wide text-slate-500">
+                                      <tr>
+                                        <th className="px-3 py-2 font-semibold">Inventory part</th>
+                                        <th className="px-3 py-2 font-semibold">Qty / unit</th>
+                                        <th className="px-3 py-2 font-semibold">Available Qty</th>
+                                        <th className="px-3 py-2 font-semibold">Required Qty</th>
+                                      </tr>
+                                    </thead>
+                                    <tbody>
+                                      {product.items.map((item) => {
+                                        const raw = item.available ?? 0
+                                        const avail = Math.max(0, raw)
+                                        return (
+                                          <tr
+                                            key={`${product.id}-${item.inventory_id}`}
+                                            className="border-b border-slate-50 last:border-0"
+                                          >
+                                            <td className="px-3 py-2 font-medium text-slate-800">{item.name}</td>
+                                            <td className="px-3 py-2 tabular-nums text-slate-600">×{item.qty_per_unit}</td>
+                                            <td
+                                              className={`px-3 py-2 font-semibold tabular-nums ${
+                                                avail <= 0 ? 'text-rose-600' : 'text-emerald-700'
+                                              }`}
+                                            >
+                                              {avail}
+                                            </td>
+                                            <td className="px-3 py-2 font-medium tabular-nums text-amber-700">
+                                              {itemRequiredOf(item)}
+                                            </td>
+                                          </tr>
+                                        )
+                                      })}
+                                    </tbody>
+                                  </table>
+                                </div>
+                              </div>
+                            )}
+                          </div>
+                        </td>
+                      </tr>
+                    )}
+
                     {isEditing && (
                       <tr className="bg-blue-50/40">
-                        <td colSpan={6} className="px-4 py-4" onClick={(e) => e.stopPropagation()}>
+                        <td colSpan={colSpan} className="px-4 py-4" onClick={(e) => e.stopPropagation()}>
                           <div className="rounded-xl border border-blue-100 bg-white p-4 shadow-sm">
                             <div className="mb-3 flex items-center justify-between gap-2">
                               <div>
                                 <p className="text-sm font-semibold text-slate-900">Edit product</p>
                                 <p className="text-xs text-slate-500">
-                                  Qty Available = how many you can still make · Booked = pending order qty
+                                  Available Qty = product stock you add · Required Qty = pending order qty
                                 </p>
                               </div>
                               <Button variant="ghost" size="sm" onClick={closeForm} aria-label="Close">
                                 <X className="h-4 w-4" />
                               </Button>
                             </div>
-                            {product.items.length > 0 && (
-                              <div className="mb-4 overflow-hidden rounded-xl border border-slate-200">
-                                <table className="w-full text-left text-sm">
-                                  <thead className="border-b border-slate-100 bg-slate-50 text-xs uppercase tracking-wide text-slate-500">
-                                    <tr>
-                                      <th className="px-3 py-2 font-semibold">Inventory part</th>
-                                      <th className="px-3 py-2 font-semibold">Qty / unit</th>
-                                      <th className="px-3 py-2 font-semibold">Qty Available</th>
-                                      <th className="px-3 py-2 font-semibold">Booked</th>
-                                    </tr>
-                                  </thead>
-                                  <tbody>
-                                    {product.items.map((item) => {
-                                      const avail = item.available ?? 0
-                                      return (
-                                        <tr key={`${product.id}-${item.inventory_id}`} className="border-b border-slate-50 last:border-0">
-                                          <td className="px-3 py-2 font-medium text-slate-800">{item.name}</td>
-                                          <td className="px-3 py-2 tabular-nums text-slate-600">×{item.qty_per_unit}</td>
-                                          <td className={`px-3 py-2 font-semibold tabular-nums ${avail <= 0 ? 'text-rose-600' : 'text-slate-800'}`}>
-                                            {avail}
-                                          </td>
-                                          <td className="px-3 py-2 font-medium tabular-nums text-amber-700">{item.booked ?? 0}</td>
-                                        </tr>
-                                      )
-                                    })}
-                                  </tbody>
-                                </table>
-                              </div>
-                            )}
                             {renderFormFields()}
                           </div>
                         </td>

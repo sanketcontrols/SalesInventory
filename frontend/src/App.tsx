@@ -5,9 +5,11 @@ import Customers from './pages/Customers'
 import CompanyProfile from './pages/CompanyProfile'
 import Dashboard from './pages/Dashboard'
 import Inventory from './pages/Inventory'
+import InventoryDetail from './pages/InventoryDetail'
 import Login from './pages/Login'
 import Orders from './pages/Orders'
 import Products from './pages/Products'
+import ProductDetail from './pages/ProductDetail'
 import Reports from './pages/Reports'
 import Settings from './pages/Settings'
 import AdminUsers from './pages/AdminUsers'
@@ -85,10 +87,26 @@ function AppRoutes() {
         }
       />
       <Route
+        path="/products/:id"
+        element={
+          <ProtectedRoute>
+            <RoleGate path="/products/:id"><ProductDetail /></RoleGate>
+          </ProtectedRoute>
+        }
+      />
+      <Route
         path="/inventory"
         element={
           <ProtectedRoute>
             <RoleGate path={ROUTES.inventory}><Inventory /></RoleGate>
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/inventory/:id"
+        element={
+          <ProtectedRoute>
+            <RoleGate path="/inventory/:id"><InventoryDetail /></RoleGate>
           </ProtectedRoute>
         }
       />

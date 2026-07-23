@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react'
 import { Link } from 'react-router-dom'
-import { Pencil, Check, X, Plus, Minus } from 'lucide-react'
+import { Pencil, Check, X } from 'lucide-react'
 import { apiFetch, getStoredUser } from '../services/api'
 
 interface InventoryItem {
@@ -10,10 +10,14 @@ interface InventoryItem {
   monthly_avg: number
   pending: number
   booked?: number
+  required_qty?: number
+  qty_used?: number
+  used?: number
   status: string
 }
 
 const statusStyles: Record<string, string> = {
+  'Stock Available': 'bg-emerald-50 text-emerald-700',
   Normal: 'bg-emerald-50 text-emerald-700',
   'Low Stock': 'bg-amber-50 text-amber-700',
   Critical: 'bg-rose-50 text-rose-700',
@@ -31,11 +35,10 @@ export default function InventorySummary({ onUpdated }: Props) {
   const [editingId, setEditingId] = useState<number | null>(null)
   const [draft, setDraft] = useState({ available: '' })
   const [saving, setSaving] = useState(false)
-  const [adjustingId, setAdjustingId] = useState<number | null>(null)
 
   const load = () => {
     apiFetch<InventoryItem[]>('/api/inventory')
-      .then((data) => setItems(data.slice(0, 4)))
+      .then((data) => setItems(data.slice(0, 6)))
       .catch(console.error)
   }
 
@@ -73,128 +76,111 @@ export default function InventorySummary({ onUpdated }: Props) {
     }
   }
 
-  const adjustQty = async (item: InventoryItem, delta: number) => {
-    if (!canEdit) return
-    setAdjustingId(item.id)
-    try {
-      const updated = await apiFetch<InventoryItem>(`/api/inventory/${item.id}/adjust`, {
-        method: 'POST',
-        body: JSON.stringify({ delta }),
-      })
-      setItems((prev) => prev.map((row) => (row.id === item.id ? { ...row, ...updated } : row)))
-      onUpdated?.()
-    } catch (error) {
-      alert(error instanceof Error ? error.message : 'Failed to adjust qty')
-    } finally {
-      setAdjustingId(null)
-    }
-  }
-
   return (
     <section className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
       <div className="mb-3 flex items-center justify-between">
         <div>
           <h2 className="text-sm font-semibold text-slate-900">Inventory Summary</h2>
-          <p className="text-xs text-slate-500">
-            Qty Available = free · Booked = pending orders · +/− to adjust
-          </p>
+          <p className="text-xs text-slate-500">Required · Available · This month used · Status</p>
         </div>
-        <Link to="/inventory" className="text-sm font-medium text-blue-600 hover:text-blue-700">View all</Link>
+        <Link to="/inventory" className="text-sm font-medium text-blue-600 hover:text-blue-700">
+          View all
+        </Link>
       </div>
-      <div className="space-y-3">
-        {items.map((item) => {
-          const isEditing = editingId === item.id
-          const booked = item.booked ?? item.pending ?? 0
-          const busy = adjustingId === item.id
-          return (
-            <div key={item.id} className="rounded-xl border border-slate-100 p-3">
-              <div className="flex items-center justify-between gap-2">
-                <p className="font-semibold text-slate-900">{item.name}</p>
-                <span className={`rounded-full px-2.5 py-1 text-xs font-semibold ${statusStyles[item.status] || 'bg-slate-100 text-slate-600'}`}>
-                  {item.status}
-                </span>
-              </div>
 
-              {isEditing ? (
-                <div className="mt-3 space-y-2">
-                  <div>
-                    <label className="mb-1 block text-xs text-slate-500">Qty Available</label>
-                    <input
-                      type="number"
-                      autoFocus
-                      value={draft.available}
-                      onChange={(e) => setDraft({ available: e.target.value })}
-                      className="w-full rounded-lg border border-blue-300 px-2 py-1.5 text-sm outline-none focus:border-blue-500"
-                    />
-                  </div>
-                  <div className="flex gap-2">
-                    <button
-                      disabled={saving}
-                      onClick={() => saveEdit(item)}
-                      className="inline-flex flex-1 items-center justify-center gap-1 rounded-lg bg-blue-600 px-2 py-1.5 text-xs font-medium text-white hover:bg-blue-700 disabled:opacity-60"
-                    >
-                      <Check className="h-3.5 w-3.5" /> Save
-                    </button>
-                    <button
-                      onClick={cancelEdit}
-                      className="inline-flex items-center justify-center gap-1 rounded-lg border border-slate-300 px-2 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50"
-                    >
-                      <X className="h-3.5 w-3.5" /> Cancel
-                    </button>
-                  </div>
-                </div>
-              ) : (
-                <div className="mt-2 grid grid-cols-3 gap-2 text-center text-xs">
-                  <div className="rounded-lg bg-slate-50 py-1.5">
-                    <div className="inline-flex items-center justify-center gap-1">
-                      {canEdit && (
-                        <button
-                          type="button"
-                          disabled={busy}
-                          onClick={() => adjustQty(item, -1)}
-                          className="rounded p-0.5 text-slate-500 hover:bg-white disabled:opacity-50"
-                          title="Subtract 1"
-                        >
-                          <Minus className="h-3 w-3" />
-                        </button>
-                      )}
-                      <button
-                        type="button"
-                        onClick={() => startEdit(item)}
-                        className={`font-semibold tabular-nums ${item.available <= 0 ? 'text-rose-600' : 'text-slate-900'} ${canEdit ? 'hover:underline' : ''}`}
-                        title={canEdit ? 'Click to set qty' : undefined}
+      <div className="overflow-x-auto">
+        <table className="w-full min-w-[560px] text-left text-sm">
+          <thead className="border-b border-slate-100 text-xs uppercase tracking-wide text-slate-500">
+            <tr>
+              <th className="px-2 py-2 font-semibold">Name</th>
+              <th className="px-2 py-2 font-semibold">Qty Required</th>
+              <th className="px-2 py-2 font-semibold">Available Qty</th>
+              <th className="px-2 py-2 font-semibold">This Month</th>
+              <th className="px-2 py-2 font-semibold">Status</th>
+              <th className="px-2 py-2 font-semibold">Action</th>
+            </tr>
+          </thead>
+          <tbody>
+            {items.map((item) => {
+              const isEditing = editingId === item.id
+              const required = item.required_qty ?? item.booked ?? item.pending ?? 0
+              return (
+                <tr key={item.id} className="border-b border-slate-50 last:border-0">
+                  <td className="px-2 py-2.5 font-medium text-slate-900">{item.name}</td>
+                  <td className="px-2 py-2.5 tabular-nums text-amber-700">{required}</td>
+                  <td className="px-2 py-2.5">
+                    {isEditing ? (
+                      <input
+                        type="number"
+                        autoFocus
+                        value={draft.available}
+                        onChange={(e) => setDraft({ available: e.target.value })}
+                        className="w-20 rounded-lg border border-blue-300 px-2 py-1 text-sm outline-none focus:border-blue-500"
+                      />
+                    ) : (
+                      <span
+                        className={`font-semibold tabular-nums ${
+                          item.available <= 0 ? 'text-rose-600' : 'text-emerald-700'
+                        }`}
                       >
                         {item.available}
-                      </button>
-                      {canEdit && (
+                      </span>
+                    )}
+                  </td>
+                  <td className="px-2 py-2.5 tabular-nums text-slate-700">
+                    {Number(item.monthly_avg || 0).toFixed(1)}
+                  </td>
+                  <td className="px-2 py-2.5">
+                    <span
+                      className={`rounded-full px-2 py-0.5 text-xs font-semibold ${
+                        statusStyles[item.status] || 'bg-slate-100 text-slate-600'
+                      }`}
+                    >
+                      {item.status}
+                    </span>
+                  </td>
+                  <td className="px-2 py-2.5">
+                    {canEdit &&
+                      (isEditing ? (
+                        <div className="flex gap-1">
+                          <button
+                            type="button"
+                            disabled={saving}
+                            onClick={() => saveEdit(item)}
+                            className="inline-flex items-center gap-1 rounded-lg bg-blue-600 px-2 py-1 text-xs font-medium text-white hover:bg-blue-700 disabled:opacity-60"
+                          >
+                            <Check className="h-3 w-3" /> Save
+                          </button>
+                          <button
+                            type="button"
+                            onClick={cancelEdit}
+                            className="inline-flex items-center gap-1 rounded-lg border border-slate-300 px-2 py-1 text-xs font-medium text-slate-700 hover:bg-slate-50"
+                          >
+                            <X className="h-3 w-3" />
+                          </button>
+                        </div>
+                      ) : (
                         <button
                           type="button"
-                          disabled={busy}
-                          onClick={() => adjustQty(item, 1)}
-                          className="rounded p-0.5 text-slate-500 hover:bg-white disabled:opacity-50"
-                          title="Add 1"
+                          onClick={() => startEdit(item)}
+                          className="inline-flex items-center gap-1 rounded-lg border border-slate-200 px-2 py-1 text-xs font-medium text-slate-700 hover:bg-slate-50"
                         >
-                          <Plus className="h-3 w-3" />
+                          <Pencil className="h-3 w-3" /> Edit
                         </button>
-                      )}
-                      {canEdit && <Pencil className="h-3 w-3 text-slate-400" />}
-                    </div>
-                    <p className="text-slate-500">Qty Available</p>
-                  </div>
-                  <div className="rounded-lg bg-slate-50 py-1.5">
-                    <p className="font-semibold tabular-nums text-amber-700">{booked}</p>
-                    <p className="text-slate-500">Booked</p>
-                  </div>
-                  <div className="rounded-lg bg-slate-50 py-1.5">
-                    <p className="font-semibold text-slate-900">{Number(item.monthly_avg || 0).toFixed(1)}</p>
-                    <p className="text-slate-500">Monthly avg</p>
-                  </div>
-                </div>
-              )}
-            </div>
-          )
-        })}
-        {items.length === 0 && <p className="text-sm text-slate-500">No inventory items yet.</p>}
+                      ))}
+                  </td>
+                </tr>
+              )
+            })}
+            {items.length === 0 && (
+              <tr>
+                <td colSpan={6} className="px-2 py-4 text-sm text-slate-500">
+                  No inventory items yet.
+                </td>
+              </tr>
+            )}
+          </tbody>
+        </table>
       </div>
     </section>
   )

@@ -47,13 +47,26 @@ interface ProductCode {
   code: string
   name: string
   description?: string
+  stock_qty?: number
+  qty_available?: number | null
   items: { name: string; sku: string; qty_per_unit: number; available: number }[]
 }
 
 interface StockBreakdown {
+  type?: 'product' | 'inventory'
   product?: string
   name: string
   display: string
+  available: number
+  booked: number
+  remaining: number
+  in_stock: boolean
+}
+
+interface ProductAvail {
+  product_code_id: number
+  product: string
+  name: string
   available: number
   booked: number
   remaining: number
@@ -113,6 +126,7 @@ export default function Orders() {
   const [activeSuggestKey, setActiveSuggestKey] = useState<string | null>(null)
   const [editData, setEditData] = useState({ status: 'Pending' })
   const [breakdown, setBreakdown] = useState<StockBreakdown[]>([])
+  const [productAvail, setProductAvail] = useState<ProductAvail[]>([])
   const [stockWarnings, setStockWarnings] = useState<string[]>([])
   const [stockOk, setStockOk] = useState(true)
 
@@ -149,21 +163,26 @@ export default function Orders() {
 
     if (items.length === 0) {
       setBreakdown([])
+      setProductAvail([])
       setStockWarnings([])
       setStockOk(true)
       return
     }
 
     try {
-      const data = await apiFetch<{ breakdown: StockBreakdown[]; warnings: { message: string }[]; stockOk: boolean }>(
-        '/api/orders/stock-check',
-        { method: 'POST', body: JSON.stringify({ items }) }
-      )
+      const data = await apiFetch<{
+        breakdown: StockBreakdown[]
+        products?: ProductAvail[]
+        warnings: { message: string }[]
+        stockOk: boolean
+      }>('/api/orders/stock-check', { method: 'POST', body: JSON.stringify({ items }) })
       setBreakdown(data.breakdown)
+      setProductAvail(data.products || [])
       setStockWarnings(data.warnings.map((w) => w.message))
       setStockOk(data.stockOk)
     } catch {
       setBreakdown([])
+      setProductAvail([])
       setStockWarnings([])
     }
   }
@@ -258,9 +277,11 @@ export default function Orders() {
       setState('')
       setLines([{ key: '1', product_code_id: '', label: '', description: '', qty: '1', price: '' }])
       setBreakdown([])
+      setProductAvail([])
       setStockWarnings([])
       setShowForm(false)
       fetchOrders()
+      apiFetch<ProductCode[]>('/api/product-codes').then(setProductCodes).catch(console.error)
     } catch (error) {
       alert(error instanceof Error ? error.message : 'Failed to create order')
     }
@@ -490,7 +511,8 @@ export default function Orders() {
           <p className="mt-2 text-xs text-slate-500">
             No of days starts from today and freezes when the order is Completed/Cancelled.
             Available to MFG shows <span className="font-medium text-emerald-600">Available</span> or{' '}
-            <span className="font-medium text-rose-600">Not Available</span> from live inventory stock.
+            <span className="font-medium text-rose-600">Not Available</span> from product stock and linked inventory.
+            Placing an order minuses product available qty and deducts attached inventory parts.
           </p>
 
           <div className="mt-5">
@@ -502,8 +524,14 @@ export default function Orders() {
             </div>
 
             <div className="space-y-2">
-              {lines.map((line) => (
-                <div key={line.key} className="relative grid gap-2 rounded-xl border border-slate-200 p-3 md:grid-cols-[1.4fr_1.4fr_90px_110px_110px_40px]">
+              {lines.map((line) => {
+                const selected = productCodes.find((c) => String(c.id) === line.product_code_id)
+                const avail = Math.max(0, Number(selected?.stock_qty ?? selected?.qty_available) || 0)
+                const live = productAvail.find((p) => String(p.product_code_id) === line.product_code_id)
+                const showAvail = live ? live.available : avail
+                const afterOrder = live ? live.remaining : avail - (Number(line.qty) || 0)
+                return (
+                <div key={line.key} className="relative grid gap-2 rounded-xl border border-slate-200 p-3 md:grid-cols-[1.4fr_1.2fr_80px_100px_100px_110px_40px]">
                   <div className="relative">
                     <div className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-slate-400">
                       <Search className="h-4 w-4" />
@@ -521,7 +549,9 @@ export default function Orders() {
                     />
                     {activeSuggestKey === line.key && suggestionsFor(line.label).length > 0 && (
                       <div className="absolute z-20 mt-1 max-h-48 w-full overflow-auto rounded-xl border border-slate-200 bg-white shadow-lg">
-                        {suggestionsFor(line.label).map((c) => (
+                        {suggestionsFor(line.label).map((c) => {
+                          const cAvail = Math.max(0, Number(c.stock_qty ?? c.qty_available) || 0)
+                          return (
                           <button
                             key={c.id}
                             type="button"
@@ -536,8 +566,21 @@ export default function Orders() {
                             className="block w-full px-3 py-2 text-left text-sm hover:bg-slate-50"
                           >
                             <span className="font-medium">{c.code}</span> — {c.name}
+                            <span
+                              className={`ml-2 text-xs font-semibold ${
+                                cAvail > 0 ? 'text-emerald-700' : 'text-rose-600'
+                              }`}
+                            >
+                              Avail {cAvail}
+                            </span>
+                            {c.items?.length ? (
+                              <span className="ml-1 text-[11px] text-slate-400">
+                                · {c.items.length} inv part{c.items.length === 1 ? '' : 's'}
+                              </span>
+                            ) : null}
                           </button>
-                        ))}
+                          )
+                        })}
                       </div>
                     )}
                   </div>
@@ -567,6 +610,25 @@ export default function Orders() {
                   <div className="flex items-center rounded-xl bg-slate-50 px-3 text-sm font-medium text-slate-800">
                     {formatRupee(lineTotal(line))}
                   </div>
+                  <div
+                    className={`flex flex-col justify-center rounded-xl px-2 py-1 text-xs ${
+                      line.product_code_id
+                        ? afterOrder >= 0
+                          ? 'bg-emerald-50 text-emerald-800'
+                          : 'bg-rose-50 text-rose-700'
+                        : 'bg-slate-50 text-slate-400'
+                    }`}
+                    title="Product available qty — will minus on place order"
+                  >
+                    {line.product_code_id ? (
+                      <>
+                        <span className="font-semibold tabular-nums">Avail {showAvail}</span>
+                        <span className="tabular-nums">After {afterOrder}</span>
+                      </>
+                    ) : (
+                      <span>Select product</span>
+                    )}
+                  </div>
                   <button
                     type="button"
                     onClick={() => removeLine(line.key)}
@@ -576,7 +638,8 @@ export default function Orders() {
                     <Trash2 className="h-4 w-4" />
                   </button>
                 </div>
-              ))}
+                )
+              })}
             </div>
           </div>
 
@@ -604,27 +667,48 @@ export default function Orders() {
           {breakdown.length > 0 && (
             <div className="mt-4 overflow-hidden rounded-xl border border-slate-200">
               <div className="border-b border-slate-200 bg-slate-50 px-4 py-2">
-                <p className="text-sm font-semibold text-slate-800">Stock for all products</p>
+                <p className="text-sm font-semibold text-slate-800">
+                  Stock check — product available + linked inventory
+                </p>
+                <p className="text-xs text-slate-500">
+                  On place order: product qty is minused and linked inventory is deducted
+                </p>
               </div>
               <table className="w-full text-sm">
                 <thead className="border-b border-slate-100 text-slate-600">
                   <tr>
+                    <th className="px-3 py-2 text-left font-medium">Type</th>
                     <th className="px-3 py-2 text-left font-medium">Product / Inventory</th>
                     <th className="px-3 py-2 text-left font-medium">Available</th>
-                    <th className="px-3 py-2 text-left font-medium">Booked</th>
-                    <th className="px-3 py-2 text-left font-medium">Remaining</th>
+                    <th className="px-3 py-2 text-left font-medium">Order qty</th>
+                    <th className="px-3 py-2 text-left font-medium">After order</th>
                   </tr>
                 </thead>
                 <tbody>
                   {breakdown.map((item) => (
                     <tr key={item.display} className={item.in_stock ? '' : 'bg-rose-50'}>
+                      <td className="px-3 py-2 text-xs font-medium uppercase text-slate-500">
+                        {item.type === 'product' ? 'Product' : 'Inventory'}
+                      </td>
                       <td className="px-3 py-2">
-                        {item.product ? <span className="text-xs text-blue-600">{item.product} · </span> : null}
+                        {item.product && item.type !== 'product' ? (
+                          <span className="text-xs text-blue-600">{item.product} · </span>
+                        ) : null}
                         {item.name}
                       </td>
-                      <td className="px-3 py-2">{item.available}</td>
-                      <td className="px-3 py-2 font-medium text-amber-700">{item.booked}</td>
-                      <td className={`px-3 py-2 font-semibold ${item.in_stock ? 'text-emerald-700' : 'text-rose-600'}`}>
+                      <td
+                        className={`px-3 py-2 font-semibold tabular-nums ${
+                          item.type === 'product' ? 'text-emerald-700' : 'text-slate-800'
+                        }`}
+                      >
+                        {item.available}
+                      </td>
+                      <td className="px-3 py-2 font-medium tabular-nums text-amber-700">{item.booked}</td>
+                      <td
+                        className={`px-3 py-2 font-semibold tabular-nums ${
+                          item.in_stock ? 'text-emerald-700' : 'text-rose-600'
+                        }`}
+                      >
                         {item.remaining}
                       </td>
                     </tr>
@@ -860,9 +944,6 @@ export default function Orders() {
                         </td>
                         <td className="px-3 py-3">
                           <span className="font-medium text-slate-900">{daysShown}</span>
-                          <p className={`text-[11px] ${isClosed ? 'text-emerald-600' : 'text-slate-400'}`}>
-                            {isClosed ? 'Closed' : 'Running'}
-                          </p>
                         </td>
                         <td className="px-3 py-3">
                           <span

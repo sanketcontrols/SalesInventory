@@ -1,9 +1,11 @@
 import { Plus, Minus, Download, Filter, Pencil } from 'lucide-react'
 import { Fragment, useEffect, useState } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { apiFetch, getStoredUser } from '../services/api'
 import { downloadExcel } from '../utils/exportExcel'
 import ImportCsvButton from '../components/ImportCsvButton'
 import EditWindowBadge from '../components/EditWindowBadge'
+import MonthlyAvgHistory from '../components/MonthlyAvgHistory'
 import { getEditWindowInfo } from '../utils/editWindow'
 import { canExport } from '../utils/roleAccess'
 
@@ -16,6 +18,9 @@ interface InventoryItem {
   monthly_avg: number
   pending: number
   booked?: number
+  required_qty?: number
+  qty_used?: number
+  used?: number
   reserved: number
   status: string
   created_at?: string
@@ -36,6 +41,7 @@ function todayLabel() {
 }
 
 export default function Inventory() {
+  const navigate = useNavigate()
   const user = getStoredUser()
   const role = user?.role
   const canExportCsv = canExport(role)
@@ -53,8 +59,7 @@ export default function Inventory() {
   const [loadingBookings, setLoadingBookings] = useState<number | null>(null)
   const [addQtyId, setAddQtyId] = useState<number | null>(null)
   const [addQtyForm, setAddQtyForm] = useState({
-    order_no: '',
-    product_code: '',
+    inward: 'Inward',
     qty: '',
     date: todayLabel(),
   })
@@ -112,8 +117,7 @@ export default function Inventory() {
   const openAddQty = (item: InventoryItem) => {
     setAddQtyId(item.id)
     setAddQtyForm({
-      order_no: '',
-      product_code: '',
+      inward: 'Inward',
       qty: '',
       date: todayLabel(),
     })
@@ -133,14 +137,13 @@ export default function Inventory() {
         method: 'POST',
         body: JSON.stringify({
           qty,
-          order_no: addQtyForm.order_no,
-          product_code: addQtyForm.product_code,
+          inward: addQtyForm.inward || 'Inward',
           date: addQtyForm.date || todayLabel(),
         }),
       })
       setItems((prev) => prev.map((row) => (row.id === item.id ? { ...row, ...updated } : row)))
       setAddQtyId(null)
-      setAddQtyForm({ order_no: '', product_code: '', qty: '', date: todayLabel() })
+      setAddQtyForm({ inward: 'Inward', qty: '', date: todayLabel() })
       await loadBookings(item.id)
     } catch (error) {
       alert(error instanceof Error ? error.message : 'Failed to add qty')
@@ -205,34 +208,24 @@ export default function Inventory() {
     }
   }
 
-  const adjustQty = async (item: InventoryItem, delta: number) => {
-    if (!canAdjust) return
-    setAdjustingId(item.id)
-    try {
-      const updated = await apiFetch<InventoryItem>(`/api/inventory/${item.id}/adjust`, {
-        method: 'POST',
-        body: JSON.stringify({ delta }),
-      })
-      setItems((prev) => prev.map((row) => (row.id === item.id ? { ...row, ...updated } : row)))
-    } catch (error) {
-      alert(error instanceof Error ? error.message : 'Failed to adjust qty')
-    } finally {
-      setAdjustingId(null)
-    }
-  }
-
   const handleExport = () => {
     downloadExcel(
       'inventory.xlsx',
       'Inventory',
       [
-        { header: 'Inventory' },
-        { header: 'Qty Available', type: 'number' },
-        { header: 'Booked (Orders)', type: 'number' },
+        { header: 'Name' },
+        { header: 'Required Qty', type: 'number' },
+        { header: 'Available Qty', type: 'number' },
         { header: 'Monthly Avg', type: 'number' },
         { header: 'Status' },
       ],
-      items.map((i) => [i.name, i.available, i.booked ?? i.pending ?? 0, i.monthly_avg ?? 0, i.status])
+      items.map((i) => [
+        i.name,
+        i.required_qty ?? i.booked ?? i.pending ?? 0,
+        i.available,
+        i.monthly_avg ?? 0,
+        i.status,
+      ])
     )
   }
 
@@ -258,13 +251,14 @@ export default function Inventory() {
   })
 
   const statusStyles: Record<string, string> = {
+    'Stock Available': 'bg-emerald-50 text-emerald-700',
     Normal: 'bg-emerald-50 text-emerald-700',
     'Low Stock': 'bg-amber-50 text-amber-700',
     Defect: 'bg-rose-50 text-rose-700',
     Critical: 'bg-rose-50 text-rose-700',
   }
 
-  const bookedOf = (item: InventoryItem) => item.booked ?? item.pending ?? 0
+  const bookedOf = (item: InventoryItem) => item.required_qty ?? item.booked ?? item.pending ?? 0
 
   return (
     <div className="space-y-6">
@@ -272,7 +266,7 @@ export default function Inventory() {
         <div>
           <h1 className="text-2xl font-semibold text-slate-900">Inventory</h1>
           <p className="mt-1 text-sm text-slate-500">
-            Click + to see order bookings. Use Add Qty to stock in with order / product code / date.
+            Required = pending (orange) · Available = green · Sold / used = red · This Month = used qty (click calendar for all months)
           </p>
         </div>
         <div className="flex flex-wrap gap-3">
@@ -308,7 +302,7 @@ export default function Inventory() {
           <label className="mb-2 block text-sm font-medium text-slate-700">Filter by Status</label>
           <select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)} className="rounded-xl border border-slate-300 px-3 py-2 outline-none focus:border-blue-500">
             <option value="">All Statuses</option>
-            <option value="Normal">Normal</option>
+            <option value="Stock Available">Stock Available</option>
             <option value="Low Stock">Low Stock</option>
             <option value="Defect">Defect</option>
           </select>
@@ -366,10 +360,10 @@ export default function Inventory() {
           <thead className="border-b border-slate-200 bg-slate-50 text-slate-600">
             <tr>
               <th className="w-10 px-3 py-3 font-medium" />
-              <th className="px-4 py-3 font-medium">Inventory</th>
-              <th className="px-4 py-3 font-medium">Qty Available</th>
-              <th className="px-4 py-3 font-medium">Booked (Orders)</th>
-              <th className="px-4 py-3 font-medium">Monthly Avg</th>
+              <th className="px-4 py-3 font-medium">Name</th>
+              <th className="px-4 py-3 font-medium">Required Qty</th>
+              <th className="px-4 py-3 font-medium">Available Qty</th>
+              <th className="px-4 py-3 font-medium">This Month</th>
               <th className="px-4 py-3 font-medium">Status</th>
               <th className="px-4 py-3 font-medium">Action</th>
             </tr>
@@ -390,15 +384,18 @@ export default function Inventory() {
             ) : (
               filtered.map((item) => {
                 const low = item.available <= 0
-                const booked = bookedOf(item)
+                const required = bookedOf(item)
                 const busy = adjustingId === item.id
                 const expanded = expandedIds.has(item.id)
                 const bookings = bookingsById[item.id] || []
                 const showAdd = addQtyId === item.id
                 return (
                   <Fragment key={item.id}>
-                    <tr className="border-b border-slate-100">
-                      <td className="px-3 py-3">
+                    <tr
+                      className="cursor-pointer border-b border-slate-100 hover:bg-slate-50/80"
+                      onClick={() => navigate(`/inventory/${item.id}`)}
+                    >
+                      <td className="px-3 py-3" onClick={(e) => e.stopPropagation()}>
                         <button
                           type="button"
                           onClick={() => toggleExpand(item)}
@@ -409,45 +406,32 @@ export default function Inventory() {
                         </button>
                       </td>
                       <td className="px-4 py-3">
-                        <p className="font-medium text-slate-900">{item.name}</p>
+                        <p className="font-medium text-slate-900 hover:text-blue-700">{item.name}</p>
                       </td>
+                      <td className="px-4 py-3 font-medium tabular-nums text-amber-700">{required}</td>
                       <td className="px-4 py-3">
-                        <div className="inline-flex items-center gap-1.5">
-                          {canAdjust && (
-                            <button
-                              type="button"
-                              disabled={busy}
-                              onClick={() => adjustQty(item, -1)}
-                              className="rounded-lg border border-slate-200 p-1 text-slate-600 hover:bg-slate-50 disabled:opacity-50"
-                              title="Subtract 1"
-                            >
-                              <Minus className="h-3.5 w-3.5" />
-                            </button>
-                          )}
-                          <span className={`min-w-[2rem] text-center font-semibold tabular-nums ${low ? 'text-rose-600' : 'text-slate-900'}`}>
-                            {item.available}
-                          </span>
-                          {canAdjust && (
-                            <button
-                              type="button"
-                              disabled={busy}
-                              onClick={() => adjustQty(item, 1)}
-                              className="rounded-lg border border-slate-200 p-1 text-slate-600 hover:bg-slate-50 disabled:opacity-50"
-                              title="Add 1"
-                            >
-                              <Plus className="h-3.5 w-3.5" />
-                            </button>
-                          )}
-                        </div>
+                        <span
+                          className={`font-semibold tabular-nums ${
+                            low ? 'text-rose-600' : 'text-emerald-700'
+                          }`}
+                        >
+                          {item.available}
+                        </span>
                       </td>
-                      <td className="px-4 py-3 font-medium tabular-nums text-amber-700">{booked}</td>
-                      <td className="px-4 py-3 text-slate-700">{Number(item.monthly_avg || 0).toFixed(1)}</td>
+                      <td className="px-4 py-3" onClick={(e) => e.stopPropagation()}>
+                        <MonthlyAvgHistory
+                          endpoint={`/api/inventory/${item.id}/monthly-stats`}
+                          title={`${item.name} — monthly used`}
+                          metricLabel="Used qty"
+                          currentValue={Number(item.monthly_avg || 0)}
+                        />
+                      </td>
                       <td className="px-4 py-3">
                         <span className={`rounded-full px-2.5 py-1 text-xs font-semibold ${statusStyles[item.status] || 'bg-slate-100 text-slate-600'}`}>
                           {item.status}
                         </span>
                       </td>
-                      <td className="px-4 py-3">
+                      <td className="px-4 py-3" onClick={(e) => e.stopPropagation()}>
                         <div className="flex flex-wrap gap-1.5">
                           {canAdjust && (
                             <button
@@ -475,23 +459,13 @@ export default function Inventory() {
                             {showAdd && canAdjust && (
                               <div className="rounded-xl border border-emerald-200 bg-white p-4">
                                 <p className="mb-3 text-sm font-semibold text-slate-900">Add Qty — {item.name}</p>
-                                <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+                                <div className="grid gap-3 sm:grid-cols-3">
                                   <div>
-                                    <label className="mb-1 block text-xs text-slate-500">Order No</label>
+                                    <label className="mb-1 block text-xs text-slate-500">Inward</label>
                                     <input
-                                      value={addQtyForm.order_no}
-                                      onChange={(e) => setAddQtyForm({ ...addQtyForm, order_no: e.target.value })}
-                                      placeholder="Optional"
-                                      className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm outline-none focus:border-blue-500"
-                                    />
-                                  </div>
-                                  <div>
-                                    <label className="mb-1 block text-xs text-slate-500">Product Code</label>
-                                    <input
-                                      value={addQtyForm.product_code}
-                                      onChange={(e) => setAddQtyForm({ ...addQtyForm, product_code: e.target.value })}
-                                      placeholder="Optional"
-                                      className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm outline-none focus:border-blue-500"
+                                      value={addQtyForm.inward}
+                                      readOnly
+                                      className="w-full rounded-lg border border-slate-300 bg-slate-50 px-3 py-2 text-sm text-slate-600 outline-none"
                                     />
                                   </div>
                                   <div>
@@ -535,7 +509,10 @@ export default function Inventory() {
 
                             <div className="overflow-hidden rounded-xl border border-slate-200 bg-white">
                               <p className="border-b border-slate-100 bg-slate-50 px-3 py-2 text-xs font-semibold uppercase tracking-wide text-slate-500">
-                                Bookings / stock moves — {item.name}
+                                History — {item.name}
+                              </p>
+                              <p className="border-b border-slate-100 px-3 py-1.5 text-[11px] text-slate-500">
+                                Add / Inward (green) · Required / Pending (orange) · Sold / used (red)
                               </p>
                               {loadingBookings === item.id ? (
                                 <p className="px-3 py-4 text-sm text-slate-500">Loading…</p>
@@ -545,21 +522,54 @@ export default function Inventory() {
                                 <table className="w-full text-left text-sm">
                                   <thead className="border-b border-slate-100 text-xs uppercase tracking-wide text-slate-500">
                                     <tr>
-                                      <th className="px-3 py-2 font-semibold">Order No</th>
+                                      <th className="px-3 py-2 font-semibold">Ref</th>
                                       <th className="px-3 py-2 font-semibold">Product Code</th>
                                       <th className="px-3 py-2 font-semibold">Qty</th>
                                       <th className="px-3 py-2 font-semibold">Date</th>
                                     </tr>
                                   </thead>
                                   <tbody>
-                                    {bookings.map((b, idx) => (
-                                      <tr key={`${item.id}-${b.order_no}-${b.product_code}-${idx}`} className="border-b border-slate-50 last:border-0">
-                                        <td className="px-3 py-2 font-medium text-slate-900">{b.order_no}</td>
-                                        <td className="px-3 py-2 font-mono font-semibold text-blue-700">{b.product_code}</td>
-                                        <td className="px-3 py-2 tabular-nums text-slate-800">{b.qty}</td>
-                                        <td className="px-3 py-2 text-slate-600">{b.date}</td>
-                                      </tr>
-                                    ))}
+                                    {bookings.map((b, idx) => {
+                                      const qty = Number(b.qty) || 0
+                                      const isInward =
+                                        (b.source === 'manual' ||
+                                          /^inward$/i.test(String(b.order_no || '')) ||
+                                          b.status === 'Added') &&
+                                        qty > 0
+                                      const isSold =
+                                        b.status === 'Completed' || qty < 0
+                                      const qtyTone = isInward
+                                        ? 'text-emerald-700'
+                                        : isSold
+                                          ? 'text-rose-600'
+                                          : 'text-amber-700'
+                                      const qtyLabel = isInward
+                                        ? `+${qty}`
+                                        : isSold
+                                          ? String(Math.abs(qty))
+                                          : String(qty)
+                                      return (
+                                        <tr
+                                          key={`${item.id}-${b.order_no}-${b.product_code}-${idx}`}
+                                          className="border-b border-slate-50 last:border-0"
+                                        >
+                                          <td
+                                            className={`px-3 py-2 font-medium ${
+                                              isInward ? 'text-emerald-700' : 'text-slate-900'
+                                            }`}
+                                          >
+                                            {b.order_no}
+                                          </td>
+                                          <td className="px-3 py-2 font-mono font-semibold text-blue-700">
+                                            {b.product_code || '—'}
+                                          </td>
+                                          <td className={`px-3 py-2 font-semibold tabular-nums ${qtyTone}`}>
+                                            {qtyLabel}
+                                          </td>
+                                          <td className="px-3 py-2 text-slate-600">{b.date}</td>
+                                        </tr>
+                                      )
+                                    })}
                                   </tbody>
                                 </table>
                               )}

@@ -3,7 +3,7 @@ import { useState, useEffect } from 'react'
 import { Link } from 'react-router-dom'
 import { apiFetch, getStoredUser } from '../services/api'
 import { downloadExcel } from '../utils/exportExcel'
-import ImportCsvButton from '../components/ImportCsvButton'
+import ImportExcelButton from '../components/ImportExcelButton'
 import { ensureRupee } from '../utils/formatRupee'
 import EditWindowBadge from '../components/EditWindowBadge'
 import { getEditWindowInfo } from '../utils/editWindow'
@@ -124,11 +124,19 @@ export default function Customers() {
   }
 
   const handleImport = async (rows: Record<string, string>[]) => {
-    const result = await apiFetch<{ imported: number; total: number; errors: string[] }>('/api/customers/import', {
+    const result = await apiFetch<{
+      imported: number
+      updated?: number
+      total: number
+      errors: string[]
+    }>('/api/customers/import', {
       method: 'POST',
       body: JSON.stringify({ rows }),
     })
-    alert(`Imported ${result.imported} of ${result.total} companies${result.errors.length ? `\nErrors: ${result.errors.slice(0, 3).join(', ')}` : ''}`)
+    alert(
+      `Companies — added: ${result.imported}, updated: ${result.updated ?? 0}, total rows: ${result.total}` +
+        (result.errors.length ? `\nErrors: ${result.errors.slice(0, 3).join(', ')}` : '')
+    )
     fetchCustomers()
   }
 
@@ -153,7 +161,7 @@ export default function Customers() {
               Export
             </button>
           )}
-          <ImportCsvButton onImport={handleImport} />
+          <ImportExcelButton kind="company" onImport={handleImport} />
           <button onClick={() => setShowForm(!showForm)} className="flex items-center gap-2 rounded-xl bg-blue-600 px-4 py-2.5 font-medium text-white transition hover:bg-blue-700">
             <Plus className="h-4 w-4" />
             Add Company

@@ -42,7 +42,11 @@ export function getHomePath(role?: AppRole): string {
 
 export function canAccessRoute(role: AppRole | undefined, path: string): boolean {
   if (!role || role === 'pending') return path === ROUTES.settings
-  return ROLE_PATHS[role].includes(path)
+  if (ROLE_PATHS[role].includes(path)) return true
+  // Product detail: /products/:id · Inventory detail: /inventory/:id
+  if (path.startsWith(`${ROUTES.products}/`) && ROLE_PATHS[role].includes(ROUTES.products)) return true
+  if (path.startsWith(`${ROUTES.inventory}/`) && ROLE_PATHS[role].includes(ROUTES.inventory)) return true
+  return false
 }
 
 export function getSidebarPaths(role?: AppRole): string[] {
