@@ -345,7 +345,6 @@ export default function ProductDetail() {
               ) : (
                 history.map((h, idx) => {
                   const sold = h.kind === 'order' && h.status === 'Completed'
-                  const pending = h.kind === 'order' && h.status === 'Pending'
                   const stock = h.kind === 'stock'
                   return (
                     <tr key={`${h.order_no}-${idx}`} className="border-b border-slate-50 last:border-0">
